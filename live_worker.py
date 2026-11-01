@@ -1,0 +1,560 @@
+"""CLI and lifecycle around native OpenCode sessions; no agent/provider execution loop."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import hashlib
+import re
+import os
+from pathlib import Path
+import resource
+import secrets
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import worker as batch
+from native_transport import NativeClient, live_settings
+
+ROOT = Path(__file__).resolve().parent
+TERMINAL = {'complete', 'incomplete', 'failed', 'interrupted'}
+
+
+class RequestAdvanced(Exception):
+    pass
+
+
+def atomic(path, value):
+    fd, filename = tempfile.mkstemp(prefix='.receipt-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(value, handle, indent=2)
+            handle.write('\n')
+        os.replace(filename, path)
+    finally:
+        if os.path.exists(filename):
+            os.unlink(filename)
+
+
+@contextmanager
+def locked(path, blocking=True):
+    with path.open('a') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        yield
+
+
+def read(directory):
+    return json.loads((directory / 'metadata.json').read_text())
+
+
+def update(directory, **fields):
+    with locked(directory / 'metadata.lock'):
+        meta = read(directory)
+        meta.update(fields)
+        atomic(directory / 'metadata.json', meta)
+        return meta
+
+
+
+def process_identity(pid):
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return fields[19]
+    except (OSError, IndexError):
+        return None
+
+
+def signal_owned(meta, kind, signum):
+    pid = meta.get(kind + '_pid')
+    token = meta.get(kind + '_start_ticks')
+    if not pid or not token:
+        return False
+    descriptor = None
+    try:
+        # pidfd pins the process across checks and prevents PID-reuse signalling races.
+        descriptor = os.pidfd_open(pid)
+        if process_identity(pid) != token or os.getpgid(pid) != meta.get(kind + '_pgid'):
+            return False
+        expected = str(ROOT / 'live_worker.py') if kind == 'owner' else str(batch.BINARY)
+        if expected.encode() not in Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0'):
+            return False
+        signal.pidfd_send_signal(descriptor, signum)
+        return True
+    except (OSError, AttributeError):
+        return False  # Never fall back to an unchecked PID signal.
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def client(directory):
+    meta = read(directory)
+    password = (directory / 'server-auth').read_text()
+    return NativeClient(meta['server_url'], password, meta['worktree'])
+
+
+def remember(directory, result):
+    meta = read(directory)
+    with locked(directory / 'metadata.lock'):
+        meta = read(directory)
+        if result.get('request_id') != meta.get('current_request_id'):
+            return
+        turn = directory / meta['latest_turn']
+        atomic(turn / 'status.json', result)
+        (turn / 'result.txt').write_text(result.get('text', ''))
+        meta.update(status=result['status'], current_result=result)
+        atomic(directory / 'metadata.json', meta)
+    if result.get('error'):
+        reason = batch.exhaustion_reason(json.dumps({'type': 'error', 'error': result['error']}))
+        if reason:
+            with batch.credit_lock():
+                batch.credit_state()
+                batch.credit_save(True, reason)
+
+
+def observe(directory, event, record=False):
+    if record:
+        with (directory / 'native-events.jsonl').open('a') as output:
+            output.write(json.dumps(event) + '\n')
+    props = event.get('properties', {})
+    error = props.get('error') or props.get('info', {}).get('error')
+    if error:
+        reason = batch.exhaustion_reason(json.dumps({'type': 'error', 'error': error}))
+        if reason:
+            with batch.credit_lock():
+                batch.credit_state()
+                batch.credit_save(True, reason)
+    part = props.get('part', {})
+    tokens = part.get('tokens')
+    if part.get('type') == 'step-finish' and isinstance(tokens, dict):
+        cache = tokens.get('cache') or {}
+        count = tokens.get('input', 0) + cache.get('read', 0) + cache.get('write', 0)
+        if count > 272000:
+            update(directory, pricing_warning={'input_tokens': count, 'boundary': 272000,
+                'message': 'Recorded input crossed the long-context pricing boundary; early compaction is best effort.'})
+
+
+def run_server(directory):
+    """One tiny native-process owner, with SSE observation and terminal-only idle reaping."""
+    os.umask(0o077)
+    batch.private_dir(directory)
+    batch.STATE = directory.parent
+    with locked(directory / 'server.lock', blocking=False):
+        meta = read(directory)
+        settings = json.loads((directory / 'settings.json').read_text())
+        env = batch.environment(directory, settings, meta.get('output_override'))
+        env.update(meta.get('command_environment', {}))
+        env['OPENCODE_SERVER_PASSWORD'] = (directory / 'server-auth').read_text()
+        env['OPENCODE_ENABLE_QUESTION_TOOL'] = 'true'
+        if meta.get('allow_commands'):
+            env['OPENCODE_PURE'] = 'false'  # Only the controlled shell.env hook in isolated config.
+        stopping = threading.Event()
+        process = None
+        def stop(_signum, _frame):
+            stopping.set()
+            if process and process.poll() is None:
+                process.terminate()
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        try:
+            with (directory / 'native-server.log').open('ab') as log:
+                offset = log.tell()
+                process = subprocess.Popen([str(batch.BINARY), 'serve', '--hostname', '127.0.0.1', '--port', '0'],
+                    cwd=meta['worktree'], env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                update(directory, owner_pid=os.getpid(), owner_start_ticks=process_identity(os.getpid()), owner_pgid=os.getpgid(os.getpid()),
+                    native_server_pid=process.pid, native_server_start_ticks=process_identity(process.pid), native_server_pgid=os.getpgid(process.pid),
+                    native_server_lifetime_peak_rss_kib=None, server_lifecycle='starting')
+                deadline = time.monotonic() + 20
+                url = None
+                while process.poll() is None and time.monotonic() < deadline and not stopping.is_set():
+                    with (directory / 'native-server.log').open() as source:
+                        source.seek(offset)
+                        for line in source:
+                            if line.startswith('opencode server listening on '):
+                                url = line.strip().split(' on ', 1)[1]
+                    if url:
+                        break
+                    time.sleep(0.05)
+                if not url:
+                    raise ValueError('Native server startup failed; inspect private native-server.log')
+                update(directory, server_url=url)
+                api = client(directory)
+                session = meta.get('session_id') or api.create_session()
+                update(directory, session_id=session, server_lifecycle='running')
+                idle_since = None
+                while process.poll() is None and not stopping.is_set():
+                    try:
+                        for event in api.events():
+                            observe(directory, event, record=True)
+                            update(directory, observer_state='connected')
+                            meta = read(directory)
+                            message = meta.get('current_request_id')
+                            result = api.snapshot(session, message) if message else None
+                            if result:
+                                remember(directory, result)
+                            terminal = result is None or result['status'] in TERMINAL
+                            idle = terminal and (result is None or result['native_status'] == 'idle')
+                            idle_since = (idle_since or time.monotonic()) if idle else None
+                            if meta.get('timeout_seconds') and not terminal and time.time() - meta.get('submitted_at', time.time()) >= meta['timeout_seconds']:
+                                api.abort(session)
+                            if idle_since is not None and time.monotonic() - idle_since >= (meta.get('idle_reap_seconds', 30) if message else 30):
+                                with locked(directory / 'control.lock'):
+                                    latest = read(directory)
+                                    if latest.get('current_request_id') == message and (not message or api.snapshot(session, message)['status'] in TERMINAL):
+                                        stopping.set()
+                                        break
+                            if stopping.is_set():
+                                break
+                    except (OSError, ValueError):
+                        if process.poll() is not None or stopping.is_set():
+                            break
+                        update(directory, observer_state='degraded')
+                        # Reconcile retained native state after transport loss; never replay a prompt.
+                        try:
+                            if read(directory).get('current_request_id'):
+                                remember(directory, api.snapshot(session, read(directory)['current_request_id']))
+                        except (OSError, ValueError):
+                            pass  # Observation failure must not terminate healthy native work.
+                        time.sleep(0.2)
+        except Exception as error:
+            update(directory, server_error=type(error).__name__)
+        finally:
+            if process:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                update(directory, native_server_lifetime_peak_rss_kib=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+            update(directory, server_lifecycle='stopped', owner_pid=None, native_server_pid=None)
+
+
+def ensure_server(directory):
+    meta = read(directory)
+    if meta.get('server_lifecycle') == 'running':
+        try:
+            if client(directory).request('GET', '/global/health').get('healthy'):
+                return
+        except OSError:
+            pass
+    with locked(directory / 'launch.lock'):
+        meta = read(directory)
+        if meta.get('server_lifecycle') == 'running':
+            try:
+                if client(directory).request('GET', '/global/health').get('healthy'):
+                    return
+            except OSError:
+                pass
+        update(directory, server_lifecycle='starting', server_error=None)
+        with (directory / 'owner.log').open('ab') as log:
+            subprocess.Popen(['/usr/bin/python3', '-I', str(ROOT / 'live_worker.py'), '_serve', str(directory)],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                             env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            meta = read(directory)
+            if meta.get('server_lifecycle') == 'running':
+                return
+            if meta.get('server_error'):
+                raise ValueError('Native backend failed; inspect private owner/server logs')
+            time.sleep(0.05)
+        raise ValueError('Native backend not ready; no task was replayed')
+
+
+def prior_submission(directory, submission_id, fingerprint):
+    if submission_id:
+        for path in directory.glob('turn-*/receipt.json'):
+            saved = json.loads(path.read_text())
+            if saved.get('submission_id') == submission_id:
+                if saved.get('task_sha256') != fingerprint:
+                    raise ValueError('Submission ID already names a different task; nothing was replayed')
+                if saved.get('stage_status') == 'pending':
+                    raise ValueError('Prior submission has uncertain native staging; inspect the retained session before any explicit new task. Nothing was replayed.')
+                return {**saved, 'run_id': directory.name, 'already_submitted': True}
+    return None
+
+
+def send(directory, task, submission_id=None):
+    if not task.strip():
+        raise ValueError('Task file is empty')
+    fingerprint = hashlib.sha256(task.encode()).hexdigest()
+    submission_id = submission_id or fingerprint
+    prior = prior_submission(directory, submission_id, fingerprint)
+    if prior:
+        return prior
+    with batch.credit_lock():
+        batch.credit_preflight()
+    ensure_server(directory)
+    with locked(directory / 'control.lock'):
+        prior = prior_submission(directory, submission_id, fingerprint)
+        if prior:
+            return prior
+        meta = read(directory)
+        api = client(directory)
+        turn = directory / ('turn-' + uuid.uuid4().hex)
+        batch.private_dir(turn)
+        (turn / 'task.txt').write_text(task)
+        with batch.credit_lock():
+            batch.credit_preflight()
+            atomic(turn / 'receipt.json', {'submission_id': submission_id, 'task_sha256': fingerprint,
+                'stage_status': 'pending', 'session_id': meta['session_id']})
+            try:
+                message, payload = api.stage(meta['session_id'], task, meta['model'], meta['reasoning'])
+            except OSError:
+                update(directory, pending_submission=turn.name)
+                raise ValueError(f'Worker {directory.name} retained an uncertain staging receipt; inspect native state before any new submission') from None
+            # Persist identity before starting execution, including ambiguous transport failures.
+            atomic(turn / 'receipt.json', {'request_id': message, 'session_id': meta['session_id'],
+                'submission_id': submission_id, 'task_sha256': fingerprint, 'stage_status': 'staged'})
+            update(directory, current_request_id=message, latest_turn=turn.name, submitted_at=time.time(),
+                   current_result=None, pending_submission=None, status='queued')
+            api.dispatch(meta['session_id'], message, payload)
+        return {'run_id': directory.name, 'session_id': meta['session_id'], 'request_id': message, 'status': 'queued'}
+
+
+def status(directory):
+    meta = read(directory)
+    if meta.get('server_lifecycle') == 'running':
+        try:
+            result = client(directory).snapshot(meta['session_id'], meta.get('current_request_id'))
+            remember(directory, result)
+        except OSError:
+            result = read(directory).get('current_result')
+            if not result or result['status'] not in TERMINAL:
+                raise ValueError('Native transport unavailable; inspect partial state before an explicit follow-up')
+    else:
+        result = meta.get('current_result') or {}
+        if result.get('status') not in TERMINAL:
+            result = {**result, 'status': 'failed', 'native_status': 'unknown',
+                'failure_reason': 'backend_stopped_without_terminal_receipt',
+                'message': 'Native termination outcome is unknown; partial text/side effects are retained. Inspect before an explicit follow-up; nothing was replayed.'}
+    return {**result, 'run_id': directory.name, 'server_lifecycle': read(directory).get('server_lifecycle'),
+            'native_server_lifetime_peak_rss_kib': read(directory).get('native_server_lifetime_peak_rss_kib'),
+            'pricing_warning': read(directory).get('pricing_warning')}
+
+
+def wait_result(directory, result, request_id):
+    # Linearize the returned cursor against send's existing control lock.
+    # Never hold it while observing native network/event activity.
+    with locked(directory / 'control.lock'):
+        meta = read(directory)
+        if meta.get('current_request_id') != request_id:
+            result = {'status': 'superseded', 'request_id': request_id,
+                      'next_request_id': meta.get('current_request_id')}
+        return {**result, 'run_id': directory.name, 'pricing_warning': meta.get('pricing_warning')}
+
+
+def wait(directory):
+    with locked(directory / 'control.lock'):
+        meta = read(directory)
+    current = status(directory)
+    if current['status'] in TERMINAL or current['status'] == 'needs_input':
+        return wait_result(directory, current, meta.get('current_request_id'))
+    def observer(event):
+        if read(directory).get('current_request_id') != meta['current_request_id']:
+            raise RequestAdvanced()
+        observe(directory, event)
+    try:
+        result = client(directory).wait(meta['session_id'], meta['current_request_id'], observer=observer)
+        remember(directory, result)
+    except RequestAdvanced:
+        result = {'status': 'superseded', 'request_id': meta['current_request_id']}
+    except OSError:
+        result = status(directory)  # Terminal receipt survives idle server reaping.
+    return wait_result(directory, result, meta.get('current_request_id'))
+
+
+def start(args):
+    with batch.credit_lock():
+        batch.credit_preflight()
+    batch.credential_check(batch.KEY)
+    task = Path(args.task_file).read_text()
+    if not task.strip():
+        raise ValueError('Task file is empty')
+    if args.timeout is not None and args.timeout < 0:
+        raise ValueError('Timeout must be positive or 0 for unlimited')
+    model = args.model if args.model.startswith('openai/') else 'openai/' + args.model
+    if not re.fullmatch(r'openai/[A-Za-z0-9][A-Za-z0-9._-]*', model):
+        raise ValueError('Expected an explicit direct OpenAI model ID')
+    limits = batch.model_limits(model, args)
+    budget = batch.output_budget(args, {}, limits)
+    steps = batch.step_limit(args, {})
+    worktree = str(Path(args.worktree).resolve(strict=True))
+    if not Path(worktree).is_dir():
+        raise ValueError('Worktree must be a directory')
+    spec = hashlib.sha256(json.dumps({'task': task, 'worktree': worktree, 'model': model, 'reasoning': args.reasoning,
+        'write': args.allow_write, 'commands': args.allow_commands, 'long_context': args.long_context,
+        'steps': steps, 'output': budget, 'limits': limits, 'timeout': args.timeout}, sort_keys=True).encode()).hexdigest()
+    directory = batch.STATE / (args.worker_id or spec[:32])
+    if directory.exists():
+        previous = read(directory)
+        if previous.get('backend') != 'native-server' or previous.get('start_spec_sha256') != spec:
+            raise ValueError('Worker ID already exists with a different initial assignment; nothing was replayed')
+        return {'run_id': directory.name, 'session_id': previous.get('session_id'),
+                'request_id': previous.get('current_request_id'), 'status': previous.get('status', 'starting'), 'already_submitted': True}
+    batch.private_dir(directory)
+    settings = batch.config(model, args.reasoning, args.allow_write, steps, key=batch.KEY, worktree=worktree, limits=limits)
+    settings = live_settings(settings, allow_commands=args.allow_commands, long_context=args.long_context,
+                             shell_plugin=(ROOT / 'command_environment.js').as_uri())
+    settings['agent']['worker']['prompt'] = ('Follow the explicit delegated task, applicable AGENTS.md and its closed command/validation allowlist. '
+        'Read applicable nested instructions before edits. No review, CI, PR, controller, commit, push or publication authority is implied. '
+        'Use questions for required clarification. Report partial effects and proof limits honestly. Tool permissions are not an OS sandbox.')
+    command_env = {}
+    if args.allow_commands:
+        command_env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        for name in ('JAVA_HOME', 'GRADLE_USER_HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT'):
+            if os.environ.get(name):
+                command_env[name] = os.environ[name]
+        command_env.setdefault('GRADLE_USER_HOME', str(Path.home() / '.gradle'))
+    atomic(directory / 'settings.json', settings)
+    (directory / 'server-auth').write_text(secrets.token_urlsafe(32))
+    atomic(directory / 'metadata.json', {'backend': 'native-server', 'start_spec_sha256': spec, 'status': 'starting', 'run_id': directory.name, 'worktree': worktree,
+        'model': model, 'reasoning': args.reasoning, 'model_limits': limits, 'model_limits_explicit': bool(args.context_window or args.model_output_limit),
+        'allow_write': args.allow_write, 'allow_commands': args.allow_commands, 'long_context': args.long_context,
+        'steps': steps, 'steps_explicit': steps is not None, 'output_override': budget, 'output_limit_explicit': budget is not None,
+        'max_output_tokens': budget or min(32000, limits['output']), 'timeout_seconds': args.timeout or None,
+        'command_environment': command_env, 'idle_reap_seconds': 30, 'server_lifecycle': 'new'})
+    return send(directory, task, args.submission_id)
+
+
+
+
+def reply(directory, question_id, answers):
+    if not isinstance(answers, list) or any(not isinstance(answer, list) or any(not isinstance(label, str) for label in answer) for answer in answers):
+        raise ValueError('Answers must be an array of arrays of strings')
+    with batch.credit_lock():
+        batch.credit_preflight()
+        meta = read(directory)
+        return client(directory).reply(meta['session_id'], question_id, answers)
+
+
+def configure_idle(directory, args):
+    fields = ('max_steps', 'max_output_tokens', 'context_window', 'model_output_limit', 'timeout', 'long_context')
+    if not any(getattr(args, field, None) is not None for field in fields):
+        return
+    with locked(directory / 'control.lock'):
+        meta = read(directory)
+        if meta.get('server_lifecycle') == 'running':
+            api = client(directory)
+            state = api.snapshot(meta['session_id'], meta.get('current_request_id'))
+            if state['native_status'] != 'idle' or state['questions']:
+                raise ValueError('Control overrides require an idle worker; send without overrides to follow up live')
+            # Stop only this idle managed backend; the native DB/session remains.
+            signal_owned(meta, 'owner', signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while read(directory).get('server_lifecycle') != 'stopped' and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if read(directory).get('server_lifecycle') != 'stopped':
+                raise ValueError('Idle backend shutdown not confirmed; controls were not changed')
+        limits = batch.model_limits(meta['model'], args, meta)
+        budget = batch.output_budget(args, meta, limits)
+        steps = batch.step_limit(args, meta)
+        timeout = getattr(args, 'timeout', None)
+        if timeout is not None and timeout < 0:
+            raise ValueError('Timeout must be positive or 0 for unlimited')
+        long_context = meta.get('long_context', False) if args.long_context is None else args.long_context
+        settings = batch.config(meta['model'], meta['reasoning'], meta['allow_write'], steps,
+            key=batch.KEY, worktree=meta['worktree'], limits=limits, long_context=long_context)
+        settings = live_settings(settings, allow_commands=meta.get('allow_commands', False), long_context=long_context,
+            shell_plugin=(ROOT / 'command_environment.js').as_uri())
+        settings['agent']['worker']['prompt'] = json.loads((directory / 'settings.json').read_text())['agent']['worker']['prompt']
+        atomic(directory / 'settings.json', settings)
+        update(directory, steps=steps, steps_explicit=steps is not None, output_override=budget,
+            output_limit_explicit=budget is not None, max_output_tokens=budget or min(32000, limits['output']),
+            model_limits=limits, model_limits_explicit=bool(meta.get('model_limits_explicit') or args.context_window or args.model_output_limit),
+            long_context=long_context, timeout_seconds=meta.get('timeout_seconds') if timeout is None else timeout or None)
+
+
+def main(argv=None):
+    os.umask(0o077)
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == '_serve':
+        run_server(Path(argv[1]))
+        return 0
+    parser = argparse.ArgumentParser(description='Managed native OpenCode live sessions; no model loop in this client')
+    sub = parser.add_subparsers(dest='action', required=True)
+    new = sub.add_parser('start')
+    for flag in ('task-file', 'worktree', 'model', 'reasoning'):
+        new.add_argument('--' + flag, required=True)
+    new.add_argument('--wait', action='store_true', help='Print the start receipt, then block on native events')
+    new.add_argument('--worker-id', type=batch.run_id, help='Optional stable ID: exactly 32 lowercase hexadecimal characters (for example, 0123456789abcdef0123456789abcdef); omit to generate one. The same initial assignment is not replayed')
+    new.add_argument('--submission-id', help='Owner-supplied idempotency key for this task')
+    for flag in ('allow-write', 'allow-commands', 'long-context'):
+        help_text = {'allow-write': 'Enable native edit tools; does not restrict Bash filesystem writes',
+            'allow-commands': 'Grant broad native Bash execution, including writes/tests; omit for read-only or Validation NONE tasks',
+            'long-context': 'Opt in to full-window native compaction policy'}[flag]
+        new.add_argument('--' + flag, action='store_true', help=help_text)
+    for flag in ('max-output-tokens', 'max-steps', 'context-window', 'model-output-limit', 'timeout'):
+        new.add_argument('--' + flag, type=int)
+    for name in ('send', 'resume', 'wait', 'status', 'result', 'cancel', 'shutdown', 'reply'):
+        item = sub.add_parser(name)
+        item.add_argument('run_id', type=batch.run_id)
+        if name in ('send', 'resume'):
+            item.add_argument('--task-file', required=True)
+            item.add_argument('--submission-id', help='Same key/task returns the prior receipt without replay')
+            for flag in ('max-output-tokens', 'max-steps', 'context-window', 'model-output-limit', 'timeout'):
+                item.add_argument('--' + flag, type=int)
+            item.add_argument('--long-context', action=argparse.BooleanOptionalAction, default=None)
+        if name == 'reply':
+            item.add_argument('--question-id', required=True)
+            item.add_argument('--answers-file', required=True, help='JSON file containing one array of selected answer strings per question, for example [["Proceed"]]')
+    args = parser.parse_args(argv)
+    batch.private_dir(batch.STATE)
+    if args.action == 'start':
+        with locked(batch.STATE / 'start.lock'):
+            result = start(args)
+    else:
+        directory = batch.STATE / args.run_id
+        batch.private_dir(directory)
+        if args.action in ('send', 'resume'):
+            configure_idle(directory, args)
+            result = send(directory, Path(args.task_file).read_text(), args.submission_id)
+        elif args.action == 'wait':
+            result = wait(directory)
+        elif args.action in ('status', 'result'):
+            result = status(directory)
+            if args.action == 'result':
+                print(result.get('text', ''))
+                return 0
+        elif args.action == 'reply':
+            meta = read(directory)
+            reply(directory, args.question_id, json.loads(Path(args.answers_file).read_text()))
+            result = {'run_id': directory.name, 'status': 'answer_submitted'}
+        else:
+            meta = read(directory)
+            if meta.get('server_lifecycle') == 'running':
+                client(directory).abort(meta['session_id'])  # Native cancellation first; existing edits persist.
+                if args.action == 'shutdown' and meta.get('owner_pid'):
+                    if not signal_owned(meta, 'owner', signal.SIGTERM):
+                        signal_owned(meta, 'native_server', signal.SIGTERM)
+                    deadline = time.monotonic() + 10
+                    while read(directory).get('server_lifecycle') != 'stopped' and time.monotonic() < deadline:
+                        if process_identity(meta.get('native_server_pid')) != meta.get('native_server_start_ticks'):
+                            update(directory, server_lifecycle='stopped', owner_pid=None, native_server_pid=None)
+                            break
+                        time.sleep(0.05)
+                    if read(directory).get('server_lifecycle') != 'stopped':
+                        raise ValueError('Backend shutdown not confirmed; inspect private lifecycle state')
+            result = {'run_id': directory.name, 'status': 'cancel_requested' if args.action == 'cancel' else 'stopped'}
+    if args.action == 'start' and args.wait:
+        print(json.dumps(result), flush=True)
+        result = wait(batch.STATE / result['run_id'])
+    print(json.dumps(result))
+    if args.action == 'wait' or (args.action == 'start' and args.wait):
+        return {'complete': 0, 'incomplete': 2, 'needs_input': 3, 'superseded': 4, 'interrupted': 124}.get(result['status'], 1)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError) as error:
+        print('api-worker: ' + str(error), file=sys.stderr)
+        raise SystemExit(1)
