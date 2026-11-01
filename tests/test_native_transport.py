@@ -230,6 +230,65 @@ class NativeServerTests(unittest.TestCase):
         self.assertEqual(result['request_id'], request)
         self.assertEqual(len(self.provider.requests), 3)
 
+    def managed_dispatch_failure(self, accepted):
+        task = self.root / 'managed-task.txt'
+        task.write_text('Fixture managed dispatch identity')
+        args = argparse.Namespace(task_file=str(task), worktree=str(self.project), model='openai/gpt-6-luna', reasoning='high',
+            allow_write=False, allow_commands=False, long_context=False, max_steps=None, max_output_tokens=None,
+            context_window=None, model_output_limit=None, timeout=None, worker_id='a' * 32, submission_id='fixture-initial')
+        directory = self.root / args.worker_id
+        def ensure(directory):
+            live.update(directory, session_id=self.session, server_lifecycle='running')
+        original = self.client.dispatch
+        def ambiguous(session, message, payload):
+            if accepted:
+                original(session, message, payload)
+            raise OSError('Fixture lost dispatch acknowledgement' if accepted else 'Fixture failed before dispatch')
+        with mock.patch.object(live.batch, 'STATE', self.root), mock.patch.object(live.batch, 'KEY', self.root / 'dummy-key'), mock.patch.object(live, 'ensure_server', side_effect=ensure), mock.patch.object(live, 'client', return_value=self.client):
+            with live.batch.credit_lock(): live.batch.credit_save(False, None)
+            with mock.patch.object(self.client, 'dispatch', side_effect=ambiguous) as dispatch:
+                with self.assertRaisesRegex(ValueError, 'uncertain native dispatch'):
+                    live.start(args)
+                message = live.read(directory)['current_request_id']
+                receipt_path = directory / live.read(directory)['latest_turn'] / 'receipt.json'
+                self.assertEqual(json.loads(receipt_path.read_text())['dispatch_status'], 'pending')
+                if accepted:
+                    self.assertEqual(self.client.wait(self.session, message, timeout=15)['status'], 'complete')
+                    self.assertEqual(live.status(directory)['status'], 'complete')
+                    receipt = json.loads(receipt_path.read_text())
+                    self.assertEqual(receipt['dispatch_status'], 'confirmed')
+                    self.assertEqual(receipt['dispatch_confirmation'], 'native_execution')
+                    self.assertTrue(live.start(args)['already_submitted'])
+                    duplicate = live.send(directory, task.read_text(), 'fixture-initial')
+                    self.assertTrue(duplicate['already_submitted'])
+                    self.assertEqual(duplicate['request_id'], message)
+                    self.assertEqual(live.wait(directory)['status'], 'complete')
+                    self.assertEqual(len(self.provider.requests), 1)
+                else:
+                    for operation in (lambda: live.start(args),
+                                      lambda: live.send(directory, task.read_text(), 'fixture-initial'),
+                                      lambda: live.send(directory, 'Unrelated new task', 'new-submission')):
+                        with self.assertRaisesRegex(ValueError, 'Uncertain native dispatch'):
+                            operation()
+                    for result in (live.status(directory), live.wait(directory)):
+                        self.assertEqual(result['status'], 'incomplete')
+                        self.assertEqual(result['failure_reason'], 'dispatch_unconfirmed')
+                        self.assertEqual(result['request_id'], message)
+                        self.assertNotIn('already_submitted', result)
+                    self.assertEqual(len(self.provider.requests), 0)
+                self.assertEqual(dispatch.call_count, 1)
+                messages = self.client.request('GET', f'/session/{self.session}/message')
+                self.assertEqual(sum(m['info']['id'] == message for m in messages), 1)
+                user = next(m for m in messages if m['info']['id'] == message)
+                self.assertEqual([p.get('text') for p in user['parts'] if p.get('type') == 'text'], [task.read_text()])
+                self.assertEqual(len(list(directory.glob('turn-*'))), 1)
+
+    def test_dispatch_failure_before_acceptance_is_inspectable_and_never_redispatched(self):
+        self.managed_dispatch_failure(False)
+
+    def test_lost_dispatch_ack_recovers_exact_native_execution_without_redispatch(self):
+        self.managed_dispatch_failure(True)
+
     def test_native_questions_reply_and_completion(self):
         self.provider.mode = 'question'
         message = self.send()
@@ -442,6 +501,31 @@ class LiveBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'must not contain'):
                 live.send(self.directory, 'Fixture task')
             launch.assert_not_called()
+
+    def test_stopped_dispatch_uses_only_cached_exact_request_execution_evidence(self):
+        turn = self.directory / 'turn-fixture'
+        turn.mkdir(mode=0o700)
+        for request, observed, confirmed in (('native-current', False, False),
+                                              ('native-other', True, False),
+                                              ('native-current', True, True)):
+            live.atomic(turn / 'receipt.json', {'request_id': 'native-current',
+                'stage_status': 'staged', 'dispatch_status': 'pending'})
+            live.update(self.directory, current_request_id='native-current', latest_turn=turn.name,
+                pending_dispatch=turn.name, server_lifecycle='stopped',
+                current_result={'request_id': request, 'status': 'complete', 'text': 'Fixture final',
+                                'execution_observed': observed})
+            with mock.patch.object(live, 'client') as client:
+                result = live.status(self.directory)
+                client.assert_not_called()
+            self.assertEqual(result['status'], 'complete' if confirmed else 'incomplete')
+            receipt = json.loads((turn / 'receipt.json').read_text())
+            self.assertEqual(receipt['dispatch_status'], 'confirmed' if confirmed else 'pending')
+        # Acknowledgement persisted before metadata clearing is sufficient too.
+        live.update(self.directory, pending_dispatch=turn.name)
+        with mock.patch.object(live, 'client') as client:
+            self.assertEqual(live.status(self.directory)['status'], 'complete')
+            self.assertIsNone(live.read(self.directory)['pending_dispatch'])
+            client.assert_not_called()
 
     def test_question_answer_is_blocked_by_shared_credit_latch(self):
         with live.batch.credit_lock(): live.batch.credit_save(True, 'credit_balance_exhausted')
@@ -662,3 +746,13 @@ class CompactionLineageTests(unittest.TestCase):
             with mock.patch.object(client, 'messages_since', return_value=messages), mock.patch.object(client, 'request', side_effect=[[], {}, questions, native]):
                 result = client.snapshot('native-fixture', 'a')
             self.assertEqual(result['status'], expected)
+
+    def test_execution_evidence_requires_owned_assistant_not_only_staged_user_or_summary(self):
+        messages = self.messages()
+        client = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
+        states = [messages[:1], [messages[0], *messages[2:4]],
+                  [messages[0], self.user('e', [{'type': 'text', 'text': 'Unrelated explicit task'}]),
+                   self.assistant('f', 'e', text='Unrelated answer')]]
+        for state in states:
+            with mock.patch.object(client, 'messages_since', return_value=state), mock.patch.object(client, 'request', side_effect=[[], {}, [], {}]):
+                self.assertFalse(client.snapshot('native-fixture', 'a')['execution_observed'])

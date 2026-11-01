@@ -123,7 +123,8 @@ class NativeClient:
             native = self.request('GET', '/session/status').get(session_id, {'type': 'idle'})['type']
         candidates = request_assistants(messages, message_id)
         result = {'session_id': session_id, 'request_id': message_id, 'status': 'running' if native != 'idle' else 'queued',
-                  'native_status': native, 'text': '', 'questions': questions}
+                  'native_status': native, 'text': '', 'questions': questions,
+                  'execution_observed': bool(candidates)}
         if questions:
             result['status'] = 'needs_input'
         if not candidates:

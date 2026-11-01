@@ -97,12 +97,27 @@ def client(directory):
     return NativeClient(meta['server_url'], password, meta['worktree'])
 
 
+def confirm_dispatch(directory, meta, message, proof):
+    # Caller holds metadata.lock; only request-tied native evidence or HTTP ack qualifies.
+    turn = meta.get('pending_dispatch')
+    if not turn or meta.get('current_request_id') != message:
+        return
+    path = directory / turn / 'receipt.json'
+    receipt = json.loads(path.read_text())
+    if receipt.get('request_id') != message:
+        raise ValueError('Dispatch receipt identity mismatch; inspect retained state')
+    atomic(path, {**receipt, 'dispatch_status': 'confirmed', 'dispatch_confirmation': proof})
+    meta['pending_dispatch'] = None
+
+
 def remember(directory, result):
     meta = read(directory)
     with locked(directory / 'metadata.lock'):
         meta = read(directory)
         if not result.get('request_id') or result['request_id'] != meta.get('current_request_id'):
             return
+        if result.get('execution_observed'):
+            confirm_dispatch(directory, meta, result['request_id'], 'native_execution')
         turn = directory / meta['latest_turn']
         atomic(turn / 'status.json', result)
         (turn / 'result.txt').write_text(result.get('text', ''))
@@ -282,18 +297,30 @@ def prior_submission(directory, submission_id, fingerprint):
                     raise ValueError('Submission ID already names a different task; nothing was replayed')
                 if saved.get('stage_status') == 'pending':
                     raise ValueError('Prior submission has uncertain native staging; inspect the retained session before any explicit new task. Nothing was replayed.')
+                if saved.get('dispatch_status') == 'pending':
+                    raise ValueError('Prior submission has uncertain native dispatch; inspect status. Nothing was redispatched.')
                 return {**saved, 'run_id': directory.name, 'already_submitted': True}
     return None
+
+
+def require_known_dispatch(directory):
+    if read(directory).get('pending_dispatch'):
+        status(directory)  # Read-only reconciliation against this exact native request.
+        if read(directory).get('pending_dispatch'):
+            raise ValueError('Uncertain native dispatch; inspect retained status before any new submission. Nothing was redispatched.')
 
 
 def send(directory, task, submission_id=None):
     if not task.strip():
         raise ValueError('Task file is empty')
+    require_known_dispatch(directory)
     fingerprint = hashlib.sha256(task.encode()).hexdigest()
     submission_id = submission_id or fingerprint
     prior = prior_submission(directory, submission_id, fingerprint)
     if prior:
         return prior
+    if read(directory).get('pending_submission'):
+        raise ValueError('Uncertain native staging blocks new submissions; inspect retained state')
     with batch.credit_lock():
         batch.credit_preflight()
     batch.validate_worktree(read(directory)['worktree'])
@@ -303,6 +330,8 @@ def send(directory, task, submission_id=None):
         if prior:
             return prior
         meta = read(directory)
+        if meta.get('pending_dispatch') or meta.get('pending_submission'):
+            raise ValueError('Uncertain native submission blocks new tasks; inspect retained state. Nothing was redispatched.')
         if meta.get('stop_requested'):
             raise ValueError('Native backend is stopping; no task was staged. Retry explicitly after shutdown completes')
         batch.validate_worktree(meta['worktree'])
@@ -321,15 +350,31 @@ def send(directory, task, submission_id=None):
                 raise ValueError(f'Worker {directory.name} retained an uncertain staging receipt; inspect native state before any new submission') from None
             # Persist identity before starting execution, including ambiguous transport failures.
             atomic(turn / 'receipt.json', {'request_id': message, 'session_id': meta['session_id'],
-                'submission_id': submission_id, 'task_sha256': fingerprint, 'stage_status': 'staged'})
+                'submission_id': submission_id, 'task_sha256': fingerprint, 'stage_status': 'staged', 'dispatch_status': 'pending'})
             update(directory, current_request_id=message, latest_turn=turn.name, submitted_at=time.time(),
-                   current_result=None, pending_submission=None, status='queued')
-            api.dispatch(meta['session_id'], message, payload)
+                   current_result=None, pending_submission=None, pending_dispatch=turn.name, status='queued')
+            try:
+                api.dispatch(meta['session_id'], message, payload)
+            except OSError:
+                raise ValueError(f'Worker {directory.name} retained an uncertain native dispatch; inspect status. Nothing was redispatched.') from None
+            with locked(directory / 'metadata.lock'):
+                latest = read(directory)
+                confirm_dispatch(directory, latest, message, 'native_acknowledgement')
+                atomic(directory / 'metadata.json', latest)
         return {'run_id': directory.name, 'session_id': meta['session_id'], 'request_id': message, 'status': 'queued'}
 
 
 def status(directory):
     meta = read(directory)
+    if meta.get('pending_dispatch'):
+        # Receipt acknowledgement may have committed just before an owner crash.
+        with locked(directory / 'metadata.lock'):
+            meta = read(directory)
+            if meta.get('pending_dispatch'):
+                receipt = json.loads((directory / meta['pending_dispatch'] / 'receipt.json').read_text())
+                if receipt.get('dispatch_status') == 'confirmed' and receipt.get('request_id') == meta.get('current_request_id'):
+                    meta['pending_dispatch'] = None
+                    atomic(directory / 'metadata.json', meta)
     if meta.get('pending_submission') or not meta.get('current_request_id'):
         return {'run_id': directory.name, 'status': 'incomplete', 'native_status': 'unknown',
                 'server_lifecycle': meta.get('server_lifecycle'), 'pending_submission': meta.get('pending_submission'),
@@ -342,13 +387,23 @@ def status(directory):
         except OSError:
             result = read(directory).get('current_result')
             if not result or result['status'] not in TERMINAL:
-                raise ValueError('Native transport unavailable; inspect partial state before an explicit follow-up')
+                if not meta.get('pending_dispatch'):
+                    raise ValueError('Native transport unavailable; inspect partial state before an explicit follow-up')
+                result = result or {}
     else:
         result = meta.get('current_result') or {}
+        if result.get('execution_observed') and result.get('request_id') == meta.get('current_request_id'):
+            remember(directory, result)
         if result.get('status') not in TERMINAL:
             result = {**result, 'status': 'failed', 'native_status': 'unknown',
                 'failure_reason': 'backend_stopped_without_terminal_receipt',
                 'message': 'Native termination outcome is unknown; partial text/side effects are retained. Inspect before an explicit follow-up; nothing was replayed.'}
+    latest = read(directory)
+    if latest.get('pending_dispatch'):
+        result = {**result, 'status': 'incomplete', 'request_id': latest.get('current_request_id'),
+                  'failure_reason': 'dispatch_unconfirmed', 'dispatch_status': 'pending',
+                  'pending_dispatch': latest['pending_dispatch'],
+                  'message': 'Native dispatch acceptance is unknown; inspect retained state. No automatic redispatch occurs.'}
     return {**result, 'run_id': directory.name, 'server_lifecycle': read(directory).get('server_lifecycle'),
             'native_server_lifetime_peak_rss_kib': read(directory).get('native_server_lifetime_peak_rss_kib'),
             'pricing_warning': read(directory).get('pricing_warning')}
@@ -409,6 +464,8 @@ def start(args):
         previous = read(directory)
         if previous.get('backend') != 'native-server' or previous.get('start_spec_sha256') != spec:
             raise ValueError('Worker ID already exists with a different initial assignment; nothing was replayed')
+        require_known_dispatch(directory)
+        previous = read(directory)
         if not previous.get('current_request_id'):
             return send(directory, task, args.submission_id)
         return {'run_id': directory.name, 'session_id': previous.get('session_id'),
@@ -441,6 +498,7 @@ def start(args):
 
 
 def reply(directory, question_id, answers):
+    require_known_dispatch(directory)
     if not isinstance(answers, list) or any(not isinstance(answer, list) or any(not isinstance(label, str) for label in answer) for answer in answers):
         raise ValueError('Answers must be an array of arrays of strings')
     with batch.credit_lock():
@@ -455,8 +513,8 @@ def configure_idle(directory, args):
         return
     with locked(directory / 'control.lock'):
         meta = read(directory)
-        if meta.get('pending_submission'):
-            raise ValueError('Pending native staging is uncertain; inspect retained state before changing controls')
+        if meta.get('pending_submission') or meta.get('pending_dispatch'):
+            raise ValueError('Pending native submission is uncertain; inspect retained state before changing controls')
         if meta.get('server_lifecycle') == 'running':
             api = client(directory)
             if meta.get('current_request_id'):
