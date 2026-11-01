@@ -59,6 +59,16 @@ def credential_check(path=KEY):
         raise ValueError('Credential file is empty')
 
 
+def validate_worktree(value):
+    directory = Path(value).resolve(strict=True)
+    if not directory.is_dir():
+        raise ValueError('Worktree must be a directory')
+    for protected in (KEY.parent, STATE):
+        if protected.resolve().is_relative_to(directory):
+            raise ValueError('Worktree must not contain the configured credential directory or worker state')
+    return directory
+
+
 def instruction_paths(worktree):
     directory = Path(worktree).resolve(strict=True)
     return [str(candidate) for ancestor in reversed((directory, *directory.parents))
@@ -324,9 +334,7 @@ def execute(args):
         model = args.model if args.model.startswith('openai/') else 'openai/' + args.model
         if not re.fullmatch(r'openai/[A-Za-z0-9][A-Za-z0-9._-]*', model):
             raise ValueError('Model must be an explicit OpenAI model ID, optionally prefixed openai/')
-        worktree = Path(args.worktree).resolve(strict=True)
-        if not worktree.is_dir():
-            raise ValueError('Worktree must be a directory')
+        worktree = validate_worktree(args.worktree)
         directory = STATE / uuid.uuid4().hex
         meta = {'run_id': directory.name, 'worktree': str(worktree), 'model': model,
                 'reasoning': args.reasoning, 'allow_write': args.allow_write}
@@ -335,7 +343,7 @@ def execute(args):
         meta = json.loads((directory / 'metadata.json').read_text())
         if not meta.get('session_id'):
             raise ValueError('No native session ID recorded; inspect artifacts before starting another run')
-        worktree = Path(meta['worktree']).resolve(strict=True)
+        worktree = validate_worktree(meta['worktree'])
     limits = model_limits(meta['model'], args, meta)
     budget = output_budget(args, meta, limits)
     steps = step_limit(args, meta)

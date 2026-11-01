@@ -49,6 +49,29 @@ class LauncherTests(unittest.TestCase):
             alias.symlink_to(key)
             with self.assertRaises(ValueError): worker.credential_check(alias)
 
+    def test_worktree_rejects_protected_ancestors_and_symlink_aliases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            project = home / 'project'
+            project.mkdir()
+            config = home / 'config'
+            config.mkdir(mode=0o700)
+            state = home / 'state'
+            state.mkdir(mode=0o700)
+            alias = home / 'alias'
+            alias.symlink_to(home, target_is_directory=True)
+            with mock.patch.object(worker, 'KEY', config / 'dummy-key'), mock.patch.object(worker, 'STATE', state):
+                self.assertEqual(worker.validate_worktree(project), project)
+                for candidate in (home, config, state, alias):
+                    with self.assertRaisesRegex(ValueError, 'must not contain'):
+                        worker.validate_worktree(candidate)
+                with worker.credit_lock(): worker.credit_save(False, None)
+                args = argparse.Namespace(action='run', model='openai/gpt-6-luna', worktree=str(alias))
+                with mock.patch.object(worker, 'credential_check') as credential, mock.patch.object(worker.subprocess, 'Popen') as launch:
+                    with self.assertRaisesRegex(ValueError, 'must not contain'): worker.execute(args)
+                    credential.assert_not_called()
+                    launch.assert_not_called()
+
     def test_native_event_result_collection(self):
         events = '\n'.join(['{"type":"text","sessionID":"ses_fixture","part":{"text":"done"}}',
                             '{"type":"error","sessionID":"ses_fixture","error":{"name":"fixture"}}'])

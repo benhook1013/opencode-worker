@@ -101,7 +101,7 @@ def remember(directory, result):
     meta = read(directory)
     with locked(directory / 'metadata.lock'):
         meta = read(directory)
-        if result.get('request_id') != meta.get('current_request_id'):
+        if not result.get('request_id') or result['request_id'] != meta.get('current_request_id'):
             return
         turn = directory / meta['latest_turn']
         atomic(turn / 'status.json', result)
@@ -184,7 +184,7 @@ def run_server(directory):
                 update(directory, server_url=url)
                 api = client(directory)
                 session = meta.get('session_id') or api.create_session()
-                update(directory, session_id=session, server_lifecycle='running')
+                update(directory, session_id=session, server_lifecycle='running', stop_requested=False)
                 idle_since = None
                 while process.poll() is None and not stopping.is_set():
                     try:
@@ -205,6 +205,7 @@ def run_server(directory):
                                 with locked(directory / 'control.lock'):
                                     latest = read(directory)
                                     if latest.get('current_request_id') == message and (not message or api.snapshot(session, message)['status'] in TERMINAL):
+                                        update(directory, stop_requested=True)
                                         stopping.set()
                                         break
                             if stopping.is_set():
@@ -251,9 +252,14 @@ def ensure_server(directory):
                     return
             except OSError:
                 pass
+        try:
+            with locked(directory / 'server.lock', blocking=False):
+                pass
+        except BlockingIOError:
+            raise ValueError('Native owner is still active but unresponsive; no backend was replaced or task replayed') from None
         update(directory, server_lifecycle='starting', server_error=None)
         with (directory / 'owner.log').open('ab') as log:
-            subprocess.Popen(['/usr/bin/python3', '-I', str(ROOT / 'live_worker.py'), '_serve', str(directory)],
+            subprocess.Popen([sys.executable, '-I', str(ROOT / 'live_worker.py'), '_serve', str(directory)],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
                              env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
         deadline = time.monotonic() + 25
@@ -290,12 +296,16 @@ def send(directory, task, submission_id=None):
         return prior
     with batch.credit_lock():
         batch.credit_preflight()
+    batch.validate_worktree(read(directory)['worktree'])
     ensure_server(directory)
     with locked(directory / 'control.lock'):
         prior = prior_submission(directory, submission_id, fingerprint)
         if prior:
             return prior
         meta = read(directory)
+        if meta.get('stop_requested'):
+            raise ValueError('Native backend is stopping; no task was staged. Retry explicitly after shutdown completes')
+        batch.validate_worktree(meta['worktree'])
         api = client(directory)
         turn = directory / ('turn-' + uuid.uuid4().hex)
         batch.private_dir(turn)
@@ -320,6 +330,11 @@ def send(directory, task, submission_id=None):
 
 def status(directory):
     meta = read(directory)
+    if meta.get('pending_submission') or not meta.get('current_request_id'):
+        return {'run_id': directory.name, 'status': 'incomplete', 'native_status': 'unknown',
+                'server_lifecycle': meta.get('server_lifecycle'), 'pending_submission': meta.get('pending_submission'),
+                'failure_reason': 'pending_submission' if meta.get('pending_submission') else 'no_accepted_request',
+                'message': 'Native staging is uncertain or no accepted request is recorded; inspect retained staging before any explicit new submission'}
     if meta.get('server_lifecycle') == 'running':
         try:
             result = client(directory).snapshot(meta['session_id'], meta.get('current_request_id'))
@@ -385,9 +400,7 @@ def start(args):
     limits = batch.model_limits(model, args)
     budget = batch.output_budget(args, {}, limits)
     steps = batch.step_limit(args, {})
-    worktree = str(Path(args.worktree).resolve(strict=True))
-    if not Path(worktree).is_dir():
-        raise ValueError('Worktree must be a directory')
+    worktree = str(batch.validate_worktree(args.worktree))
     spec = hashlib.sha256(json.dumps({'task': task, 'worktree': worktree, 'model': model, 'reasoning': args.reasoning,
         'write': args.allow_write, 'commands': args.allow_commands, 'long_context': args.long_context,
         'steps': steps, 'output': budget, 'limits': limits, 'timeout': args.timeout}, sort_keys=True).encode()).hexdigest()
@@ -396,6 +409,8 @@ def start(args):
         previous = read(directory)
         if previous.get('backend') != 'native-server' or previous.get('start_spec_sha256') != spec:
             raise ValueError('Worker ID already exists with a different initial assignment; nothing was replayed')
+        if not previous.get('current_request_id'):
+            return send(directory, task, args.submission_id)
         return {'run_id': directory.name, 'session_id': previous.get('session_id'),
                 'request_id': previous.get('current_request_id'), 'status': previous.get('status', 'starting'), 'already_submitted': True}
     batch.private_dir(directory)
@@ -440,9 +455,15 @@ def configure_idle(directory, args):
         return
     with locked(directory / 'control.lock'):
         meta = read(directory)
+        if meta.get('pending_submission'):
+            raise ValueError('Pending native staging is uncertain; inspect retained state before changing controls')
         if meta.get('server_lifecycle') == 'running':
             api = client(directory)
-            state = api.snapshot(meta['session_id'], meta.get('current_request_id'))
+            if meta.get('current_request_id'):
+                state = api.snapshot(meta['session_id'], meta['current_request_id'])
+            else:
+                state = {'native_status': api.request('GET', '/session/status').get(meta['session_id'], {'type': 'idle'})['type'],
+                         'questions': api.questions(meta['session_id'])}
             if state['native_status'] != 'idle' or state['questions']:
                 raise ValueError('Control overrides require an idle worker; send without overrides to follow up live')
             # Stop only this idle managed backend; the native DB/session remains.

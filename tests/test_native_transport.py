@@ -313,6 +313,7 @@ class NativeServerTests(unittest.TestCase):
         self.assertFalse(owner.is_alive(), 'Completed native backend was not reaped')
         meta = live.read(directory)
         self.assertEqual(meta['server_lifecycle'], 'stopped')
+        self.assertTrue(meta['stop_requested'])
         self.assertTrue((directory / 'observer-fault-injected').exists())
         self.assertGreater(meta['native_server_lifetime_peak_rss_kib'], 0)
         self.assertEqual(live.status(directory)['status'], 'complete')  # Late attach without resident server.
@@ -322,6 +323,7 @@ class NativeServerTests(unittest.TestCase):
         live.update(directory, idle_reap_seconds=30)
         restarted = launch_owner()
         self.assertEqual(live.read(directory)['session_id'], api_session)
+        self.assertFalse(live.read(directory)['stop_requested'])
         with mock.patch.object(live.batch, 'STATE', self.root):
             second = live.send(directory, 'Explicit new task after reaping', 'next-submission')
             self.assertNotEqual(receipt['request_id'], second['request_id'])
@@ -357,10 +359,89 @@ class LiveBoundaryTests(unittest.TestCase):
         self.patch.start()
         self.addCleanup(self.patch.stop)
         with live.batch.credit_lock(): live.batch.credit_save(False, None)
+        self.project = self.root / 'project'
+        self.project.mkdir()
         self.directory = self.root / ('c' * 32)
         self.directory.mkdir(mode=0o700)
         live.atomic(self.directory / 'metadata.json', {'session_id': 'native-fixture-session',
-            'model': 'openai/gpt-6-luna', 'reasoning': 'high'})
+            'model': 'openai/gpt-6-luna', 'reasoning': 'high', 'worktree': str(self.project)})
+
+    def test_send_loses_idle_reaper_race_without_staging_or_dispatch(self):
+        def reaper_wins(directory):
+            with live.locked(directory / 'control.lock'):
+                live.update(directory, stop_requested=True, server_lifecycle='running')
+        with mock.patch.object(live, 'ensure_server', side_effect=reaper_wins), mock.patch.object(live, 'client') as client:
+            with self.assertRaisesRegex(ValueError, 'stopping'):
+                live.send(self.directory, 'Fixture task', 'reaper-race')
+            client.assert_not_called()
+        self.assertEqual(list(self.directory.glob('turn-*')), [])
+
+    def test_live_owner_lock_blocks_replacement_after_health_failure(self):
+        live.update(self.directory, server_lifecycle='running')
+        api = mock.Mock()
+        api.request.side_effect = OSError('fixture unresponsive health')
+        before = live.read(self.directory)
+        with live.locked(self.directory / 'server.lock'), mock.patch.object(live, 'client', return_value=api), mock.patch.object(live.subprocess, 'Popen') as launch:
+            with self.assertRaisesRegex(ValueError, 'still active but unresponsive'):
+                live.ensure_server(self.directory)
+            launch.assert_not_called()
+        self.assertEqual(live.read(self.directory), before)
+
+    def test_pending_staging_is_inspectable_without_snapshot_or_latest_turn(self):
+        live.update(self.directory, server_lifecycle='running', pending_submission='turn-uncertain')
+        with mock.patch.object(live, 'client') as client:
+            live.remember(self.directory, {'status': 'complete'})
+            result = live.status(self.directory)
+            self.assertEqual(result['status'], 'incomplete')
+            self.assertEqual(result['pending_submission'], 'turn-uncertain')
+            args = argparse.Namespace(max_steps=2)
+            with self.assertRaisesRegex(ValueError, 'uncertain'):
+                live.configure_idle(self.directory, args)
+            client.assert_not_called()
+        live.update(self.directory, current_request_id='prior-request')
+        with mock.patch.object(live, 'client') as client:
+            self.assertEqual(live.status(self.directory)['failure_reason'], 'pending_submission')
+            client.assert_not_called()
+        live.update(self.directory, pending_submission=None, current_request_id=None)
+        api = mock.Mock()
+        api.request.return_value = {'native-fixture-session': {'type': 'busy'}}
+        api.questions.return_value = []
+        with mock.patch.object(live, 'client', return_value=api):
+            with self.assertRaisesRegex(ValueError, 'idle worker'):
+                live.configure_idle(self.directory, args)
+            api.snapshot.assert_not_called()
+
+    def test_retry_start_without_request_reaches_idempotent_send_and_uncertain_guard(self):
+        task = self.root / 'initial.txt'
+        task.write_text('Fixture initial task')
+        key = self.root / 'dummy-key'
+        key.write_text('fixture-only')
+        key.chmod(0o600)
+        args = argparse.Namespace(task_file=str(task), worktree=str(self.project), model='openai/gpt-6-luna', reasoning='high',
+            allow_write=False, allow_commands=False, long_context=False, max_steps=None, max_output_tokens=None,
+            context_window=None, model_output_limit=None, timeout=None, worker_id='d' * 32, submission_id='initial')
+        with mock.patch.object(live.batch, 'KEY', key):
+            with mock.patch.object(live, 'send', side_effect=OSError('fixture startup failure')):
+                with self.assertRaises(OSError): live.start(args)
+            with mock.patch.object(live, 'send', return_value={'request_id': 'native-accepted'}) as send:
+                self.assertEqual(live.start(args)['request_id'], 'native-accepted')
+                send.assert_called_once()
+            directory = self.root / args.worker_id
+            live.update(directory, session_id='native-fixture-session')
+            api = mock.Mock()
+            api.stage.side_effect = OSError('fixture lost stage')
+            with mock.patch.object(live, 'ensure_server'), mock.patch.object(live, 'client', return_value=api):
+                with self.assertRaisesRegex(ValueError, 'uncertain'): live.start(args)
+                with self.assertRaisesRegex(ValueError, 'uncertain'): live.start(args)
+                self.assertEqual(api.stage.call_count, 1)
+                api.dispatch.assert_not_called()
+
+    def test_existing_managed_worker_protected_scope_rejects_before_launch(self):
+        live.update(self.directory, worktree=str(self.root))
+        with mock.patch.object(live, 'ensure_server') as launch:
+            with self.assertRaisesRegex(ValueError, 'must not contain'):
+                live.send(self.directory, 'Fixture task')
+            launch.assert_not_called()
 
     def test_question_answer_is_blocked_by_shared_credit_latch(self):
         with live.batch.credit_lock(): live.batch.credit_save(True, 'credit_balance_exhausted')
@@ -397,6 +478,8 @@ class LiveBoundaryTests(unittest.TestCase):
             context_window=None, model_output_limit=None, timeout=None, worker_id='d' * 32, submission_id='initial')
         with mock.patch.object(live.batch, 'KEY', key), mock.patch.object(live, 'send', return_value={'run_id': args.worker_id}) as send:
             live.start(args)
+            directory = self.root / args.worker_id
+            live.update(directory, current_request_id='native-accepted')
             live.start(args)
             self.assertEqual(send.call_count, 1)
             args.worktree = str(second)
@@ -484,7 +567,7 @@ class LiveBoundaryTests(unittest.TestCase):
             self.assertEqual(result['native_status'], 'unknown')
             self.assertEqual(result['text'], 'Retained partial fixture')
             self.assertEqual(live.wait(self.directory)['status'], 'failed')
-        live.atomic(self.directory / 'metadata.json', {'server_lifecycle': 'stopped',
+        live.atomic(self.directory / 'metadata.json', {'server_lifecycle': 'stopped', 'current_request_id': 'native-complete',
             'current_result': {'status': 'complete', 'request_id': 'native-complete', 'text': 'Final fixture'}})
         self.assertEqual(live.status(self.directory)['status'], 'complete')
 
