@@ -13,6 +13,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def snapshot_due(event, last_snapshot):
+    """Reconcile lifecycle and question changes immediately; throttle other events to once a second."""
+    kind = event.get('type', '')
+    return (kind in {'server.connected', 'session.status', 'session.idle', 'session.error', 'message.updated'}
+            or kind.startswith('question.') or time.monotonic() - last_snapshot >= 1)
+
+
 def request_assistants(messages, message_id):
     """Follow only pinned native auto-compaction markers until the next explicit turn."""
     ordered = sorted(messages, key=lambda message: message['info']['id'])
@@ -185,13 +192,17 @@ class NativeClient:
                         observer(result)
                     if result['status'] in terminal:
                         return result
+                    last_snapshot = time.monotonic()
                     for event in stream:
                         if observer:
                             observer(event)
                         if timeout is not None and time.monotonic() - started >= timeout:
                             return {**result, 'wait_timed_out': True}
+                        if not snapshot_due(event, last_snapshot):
+                            continue
                         # Reconcile retained native state; no replay on transport reconnect.
                         result = self.snapshot(session_id, message_id)
+                        last_snapshot = time.monotonic()
                         if result['status'] in terminal:
                             if observer:
                                 observer(result)

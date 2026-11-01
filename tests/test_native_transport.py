@@ -409,6 +409,97 @@ class NativeServerTests(unittest.TestCase):
             process.join()
 
 
+class EventReconciliationTests(unittest.TestCase):
+    def test_token_events_are_throttled_but_outcome_events_are_immediate(self):
+        """Keep questions and completion responsive while rate-limiting delta and heartbeat snapshots."""
+        with mock.patch.object(transport.time, 'monotonic', return_value=10.5):
+            for kind in ('message.part.updated', 'message.part.delta', 'server.heartbeat'):
+                self.assertFalse(transport.snapshot_due({'type': kind}, 10))
+                self.assertTrue(transport.snapshot_due({'type': kind}, 9.5))
+            for kind in ('server.connected', 'session.status', 'session.idle', 'session.error',
+                         'message.updated', 'question.asked', 'question.replied', 'question.rejected'):
+                self.assertTrue(transport.snapshot_due({'type': kind}, 10.5))
+
+    def test_wait_observes_token_burst_without_snapshotting_every_delta(self):
+        """Observe every delta and close the stream while immediately returning questions or completion."""
+        client = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
+        running = {'status': 'running', 'request_id': 'fixture-request'}
+        for kind, status in [('question.asked', 'needs_input'), ('session.idle', 'complete')]:
+            closed = []
+
+            def events():
+                """Stream many deltas followed by a decisive event, recording generator cleanup."""
+                try:
+                    yield {'type': 'server.connected'}
+                    for _ in range(1000):
+                        yield {'type': 'message.part.delta'}
+                    yield {'type': kind}
+                finally:
+                    closed.append(True)
+
+            observer = mock.Mock()
+            with self.subTest(kind=kind), mock.patch.object(client, 'events', side_effect=events), \
+                    mock.patch.object(client, 'snapshot', side_effect=[running, {'status': status}]) as snapshot, \
+                    mock.patch.object(transport.time, 'monotonic', return_value=100):
+                self.assertEqual(client.wait('fixture-session', 'fixture-request', observer=observer)['status'], status)
+            self.assertEqual(snapshot.call_count, 2)
+            self.assertEqual(observer.call_count, 1003)  # Initial result, deltas, decisive event, terminal result.
+            self.assertEqual(closed, [True])
+
+    def test_owner_throttles_snapshots_and_only_writes_connected_state_once(self):
+        """Preserve raw observation while a token burst avoids full snapshots and repeated state writes."""
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            project = directory / 'project'
+            project.mkdir()
+            live.atomic(directory / 'metadata.json', {'session_id': 'fixture-session',
+                'worktree': str(project), 'current_request_id': 'fixture-request'})
+            live.atomic(directory / 'settings.json', {})
+            (directory / 'server-auth').write_text('fixture-only')
+            process = mock.Mock(pid=12345)
+            process.poll.return_value = None
+            api = mock.Mock()
+            api.snapshot.side_effect = [
+                {'status': 'running', 'native_status': 'busy'},
+                {'status': 'needs_input', 'native_status': 'idle'},
+                {'status': 'complete', 'native_status': 'idle'},
+            ]
+
+            def launch(*args, **kwargs):
+                """Expose a fixture server address without starting a process or network listener."""
+                with (directory / 'native-server.log').open('a') as log:
+                    log.write('opencode server listening on http://127.0.0.1:1\n')
+                return process
+
+            def events():
+                """Stop the fake process after a burst and outcome-changing events are consumed."""
+                yield {'type': 'server.connected'}
+                for _ in range(1000):
+                    yield {'type': 'message.part.updated'}
+                yield {'type': 'question.asked'}
+                yield {'type': 'session.idle'}
+                process.poll.return_value = 0
+
+            api.events.side_effect = events
+            with mock.patch.object(live.batch, 'STATE', directory), \
+                    mock.patch.object(live.batch, 'environment', return_value={}), \
+                    mock.patch.object(live.subprocess, 'Popen', side_effect=launch), \
+                    mock.patch.object(live, 'process_identity', return_value='fixture-ticks'), \
+                    mock.patch.object(live.os, 'getpgid', return_value=12345), \
+                    mock.patch.object(live.signal, 'signal'), \
+                    mock.patch.object(live.time, 'monotonic', return_value=100), \
+                    mock.patch.object(live, 'client', return_value=api), \
+                    mock.patch.object(live, 'remember') as remember, \
+                    mock.patch.object(live, 'update', wraps=live.update) as update:
+                live.run_server(directory)
+            self.assertEqual(api.snapshot.call_count, 3)
+            self.assertEqual(remember.call_count, 3)
+            self.assertEqual(sum(call.kwargs.get('observer_state') == 'connected'
+                                 for call in update.call_args_list), 1)
+            self.assertEqual(len((directory / 'native-events.jsonl').read_text().splitlines()), 1003)
+            self.assertEqual(live.read(directory)['server_lifecycle'], 'stopped')
+
+
 class LiveBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

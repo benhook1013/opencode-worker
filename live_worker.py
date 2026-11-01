@@ -18,7 +18,7 @@ import time
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import worker as batch
-from native_transport import NativeClient, live_settings
+from native_transport import NativeClient, live_settings, snapshot_due
 
 ROOT = Path(__file__).resolve().parent
 TERMINAL = {'complete', 'incomplete', 'failed', 'interrupted'}
@@ -201,14 +201,21 @@ def run_server(directory):
                 session = meta.get('session_id') or api.create_session()
                 update(directory, session_id=session, server_lifecycle='running', stop_requested=False)
                 idle_since = None
+                last_snapshot = float('-inf')
                 while process.poll() is None and not stopping.is_set():
                     try:
                         for event in api.events():
                             observe(directory, event, record=True)
-                            update(directory, observer_state='connected')
                             meta = read(directory)
+                            if meta.get('observer_state') != 'connected':
+                                meta = update(directory, observer_state='connected')
+                            if stopping.is_set():
+                                break
+                            if not snapshot_due(event, last_snapshot):
+                                continue
                             message = meta.get('current_request_id')
                             result = api.snapshot(session, message) if message else None
+                            last_snapshot = time.monotonic()
                             if result:
                                 remember(directory, result)
                             terminal = result is None or result['status'] in TERMINAL
