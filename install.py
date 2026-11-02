@@ -12,11 +12,13 @@ MODULES = ('worker.py', 'live_worker.py', 'native_transport.py', 'cli_router.py'
 
 def install(prefix):
     prefix = prefix.expanduser().resolve()
+    runtime = (SOURCE / 'runtime').resolve()
+    if prefix == runtime or runtime in prefix.parents:
+        raise ValueError('Choose a --prefix outside the source runtime')
     destination = prefix / 'share/api-worker'
     launcher = prefix / 'bin/api-worker'
     if destination.exists() or destination.is_symlink() or launcher.exists() or launcher.is_symlink():
         raise ValueError('Refusing existing api-worker destination or launcher; choose a fresh --prefix')
-    runtime = SOURCE / 'runtime'
     if not (runtime / 'node_modules/opencode-linux-x64/bin/opencode').is_file():
         raise ValueError('Prepare the pinned runtime first: npm ci --prefix runtime (Linux x86_64 required)')
     destination.parent.mkdir(parents=True, exist_ok=True)

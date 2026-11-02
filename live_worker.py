@@ -29,12 +29,20 @@ class RequestAdvanced(Exception):
 
 
 def atomic(path, value):
+    """Durably replace a receipt by syncing its temporary file and containing directory."""
     fd, filename = tempfile.mkstemp(prefix='.receipt-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as handle:
             json.dump(value, handle, indent=2)
             handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(filename, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if os.path.exists(filename):
             os.unlink(filename)

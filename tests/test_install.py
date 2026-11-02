@@ -79,6 +79,28 @@ class InstallTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('absolute path', result.stderr)
 
+    def test_source_runtime_prefixes_are_rejected_before_creating_or_copying_output(self):
+        """Reject the runtime, descendants, and symlink aliases before recursive staging can begin."""
+        spec = importlib.util.spec_from_file_location('fixture_installer', ROOT / 'install.py')
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / 'source/runtime'
+            binary = runtime / 'node_modules/opencode-linux-x64/bin/opencode'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('fixture')
+            alias = root / 'runtime-alias'
+            alias.symlink_to(runtime, target_is_directory=True)
+            for prefix in (runtime, runtime / 'nested/prefix', alias, alias / 'nested/prefix'):
+                with self.subTest(prefix=prefix), mock.patch.object(installer, 'SOURCE', runtime.parent), \
+                        mock.patch.object(Path, 'mkdir') as mkdir, \
+                        mock.patch.object(installer.shutil, 'copytree') as copytree:
+                    with self.assertRaisesRegex(ValueError, 'outside the source runtime'):
+                        installer.install(prefix)
+                    mkdir.assert_not_called()
+                    copytree.assert_not_called()
+
     def test_failed_launcher_creation_rolls_back_only_its_own_file(self):
         spec = importlib.util.spec_from_file_location('fixture_installer', ROOT / 'install.py')
         installer = importlib.util.module_from_spec(spec)

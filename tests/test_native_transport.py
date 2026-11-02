@@ -9,6 +9,7 @@ import os
 from unittest import mock
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -526,6 +527,28 @@ class LiveBoundaryTests(unittest.TestCase):
             client.assert_not_called()
         self.assertEqual(list(self.directory.glob('turn-*')), [])
 
+    def test_metadata_sync_failure_prevents_native_dispatch(self):
+        """Fail the durable pending-dispatch metadata write before any native generation can start."""
+        fsync = os.fsync
+        api = mock.Mock()
+        api.stage.return_value = ('fixture-message', {})
+
+        def fail_pending_metadata_sync(fd):
+            """Allow staging receipts to sync, then fail the pending metadata file sync."""
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                path = Path(os.readlink(f'/proc/self/fd/{fd}'))
+                if path.parent == self.directory and json.loads(path.read_text()).get('pending_dispatch'):
+                    raise OSError('fixture pending metadata sync failure')
+            fsync(fd)
+
+        with mock.patch.object(live, 'ensure_server'), mock.patch.object(live, 'client', return_value=api), \
+                mock.patch.object(live.os, 'fsync', side_effect=fail_pending_metadata_sync):
+            with self.assertRaisesRegex(OSError, 'pending metadata sync failure'):
+                live.send(self.directory, 'Fixture task', 'durable-dispatch')
+        api.stage.assert_called_once()
+        api.dispatch.assert_not_called()
+        self.assertIsNone(live.read(self.directory).get('pending_dispatch'))
+
     def test_live_owner_lock_blocks_replacement_after_health_failure(self):
         live.update(self.directory, server_lifecycle='running')
         api = mock.Mock()
@@ -763,6 +786,70 @@ class LiveBoundaryTests(unittest.TestCase):
         live.atomic(self.directory / 'metadata.json', {'server_lifecycle': 'stopped', 'current_request_id': 'native-complete',
             'current_result': {'status': 'complete', 'request_id': 'native-complete', 'text': 'Final fixture'}})
         self.assertEqual(live.status(self.directory)['status'], 'complete')
+
+
+class AtomicReceiptTests(unittest.TestCase):
+    def test_atomic_syncs_contents_before_replace_and_directory_after(self):
+        """Observe flushed JSON before file sync and the new directory entry before directory sync."""
+        fsync, replace = os.fsync, os.replace
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            path = directory / 'receipt.json'
+            path.write_text('{"old": true}')
+            expected = {'dispatch_status': 'pending'}
+            events, descriptors = [], []
+
+            def observe_sync(fd):
+                """Check the appropriate pre-rename or post-rename durable-write boundary."""
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    self.assertEqual(os.fstat(fd).st_ino, directory.stat().st_ino)
+                    self.assertEqual(json.loads(path.read_text()), expected)
+                    self.assertEqual(list(directory.glob('.receipt-*')), [])
+                    descriptors.append(fd)
+                    events.append('directory')
+                else:
+                    temporary_path, = directory.glob('.receipt-*')
+                    self.assertEqual(json.loads(temporary_path.read_text()), expected)
+                    self.assertEqual(json.loads(path.read_text()), {'old': True})
+                    events.append('file')
+                fsync(fd)
+
+            def observe_replace(source, target):
+                replace(source, target)
+                events.append('replace')
+
+            with mock.patch.object(live.os, 'fsync', side_effect=observe_sync), \
+                    mock.patch.object(live.os, 'replace', side_effect=observe_replace):
+                live.atomic(path, expected)
+            self.assertEqual(events, ['file', 'replace', 'directory'])
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+
+    def test_atomic_sync_failures_propagate_without_leaking_temp_files_or_descriptors(self):
+        """Preserve old contents before rename and report post-rename sync failures without hiding them."""
+        fsync = os.fsync
+        for failure in ('file', 'directory'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                path = directory / 'receipt.json'
+                path.write_text('{"old": true}')
+                descriptors = []
+
+                def fail_sync(fd):
+                    """Inject failure at the selected file or directory durability boundary."""
+                    kind = 'directory' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file'
+                    if kind == failure:
+                        descriptors.append(fd)
+                        raise OSError('fixture sync failure')
+                    fsync(fd)
+
+                with mock.patch.object(live.os, 'fsync', side_effect=fail_sync):
+                    with self.assertRaisesRegex(OSError, 'fixture sync failure'):
+                        live.atomic(path, {'new': True})
+                self.assertEqual(json.loads(path.read_text()), {'old': True} if failure == 'file' else {'new': True})
+                self.assertEqual(list(directory.glob('.receipt-*')), [])
+                with self.assertRaises(OSError):
+                    os.fstat(descriptors[0])
 
 
 class CompactionLineageTests(unittest.TestCase):
