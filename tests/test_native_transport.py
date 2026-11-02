@@ -686,6 +686,24 @@ class LiveBoundaryTests(unittest.TestCase):
             self.assertEqual(router.main(['run', '--live', '--allow-commands', '--task-file', 'fixture']), 0)
             self.assertEqual(native.call_args.args[0], ['start', '--allow-commands', '--task-file', 'fixture', '--wait'])
 
+    def test_live_run_accepts_variant_alias_forms_and_preserves_wait_routing(self):
+        """Parse both batch-style variant aliases through each managed-run route without dispatching work."""
+        for route in ('--live', '--allow-commands'):
+            for reasoning in (['--variant', 'high'], ['--variant=high'], ['--reasoning', 'high']):
+                with self.subTest(route=route, reasoning=reasoning), \
+                        mock.patch.object(router.live.batch, 'STATE', self.root), \
+                        mock.patch.object(router.live, 'start', return_value={'run_id': self.directory.name}) as start, \
+                        mock.patch.object(router.live, 'wait', return_value={'status': 'complete'}) as wait, \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(router.main(['run', route, '--task-file', 'fixture-task',
+                        '--worktree', str(self.project), '--model', 'openai/gpt-6-luna', *reasoning]), 0)
+                    start.assert_called_once()
+                    self.assertEqual(start.call_args.args[0].reasoning, 'high')
+                    self.assertTrue(start.call_args.args[0].wait)
+                    self.assertEqual(start.call_args.args[0].allow_commands, route == '--allow-commands')
+                    wait.assert_called_once_with(self.directory)
+                    self.assertEqual(len(output.getvalue().splitlines()), 2)
+
     def test_wait_cursor_cannot_report_an_old_request_as_new_completion(self):
         live.atomic(self.directory / 'metadata.json', {'current_request_id': 'native-old', 'session_id': 'native-session'})
         api = mock.Mock()
