@@ -119,7 +119,8 @@ def configure_dispatch(directory, api, meta):
     if acknowledged_at is None:
         return
     observed = meta.get('session_error') or {}
-    error = observed.get('error') if observed.get('request_id') == message else None
+    error = observed.get('error') if (observed.get('request_id') == message
+        and observed.get('attribution') == 'explicit_message_id') else None
     api.note_dispatch(meta['session_id'], message, acknowledged_at, error)
 
 
@@ -168,8 +169,8 @@ def observe(directory, event, record=False):
         with locked(directory / 'metadata.lock'):
             meta = read(directory)
             message = meta.get('current_request_id')
-            if message and props.get('sessionID') == meta.get('session_id') and props.get('messageID', message) == message:
-                meta['session_error'] = {'request_id': message, 'error': error}
+            if message and props.get('sessionID') == meta.get('session_id') and props.get('messageID') == message:
+                meta['session_error'] = {'request_id': message, 'error': error, 'attribution': 'explicit_message_id'}
                 atomic(directory / 'metadata.json', meta)
     if error:
         reason = batch.exhaustion_reason(json.dumps({'type': 'error', 'error': error}))
@@ -448,6 +449,12 @@ def status(directory):
                   'failure_reason': 'dispatch_unconfirmed', 'dispatch_status': 'pending',
                   'pending_dispatch': latest['pending_dispatch'],
                   'message': 'Native dispatch acceptance is unknown; inspect retained state. No automatic redispatch occurs.'}
+    # Older receipts inferred ownership from session identity alone. Keep their raw
+    # diagnostic, but never expose it as a qualified request error on late attachment.
+    if (result.get('incomplete_reason') == 'dispatched_without_execution' and result.get('error')
+            and result.get('error_attribution') != 'explicit_message_id'):
+        result = {**result, 'unattributed_session_error': result['error']}
+        result.pop('error')
     return {**result, 'run_id': directory.name, 'server_lifecycle': read(directory).get('server_lifecycle'),
             'native_server_lifetime_peak_rss_kib': read(directory).get('native_server_lifetime_peak_rss_kib'),
             'pricing_warning': read(directory).get('pricing_warning')}

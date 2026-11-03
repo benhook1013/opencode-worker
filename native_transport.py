@@ -81,7 +81,7 @@ class NativeClient:
         context = self.dispatch_context.get((session_id, message_id))
         if (context is not None and event.get('type') == 'session.error'
                 and props.get('sessionID') == session_id
-                and props.get('messageID', message_id) == message_id and props.get('error')):
+                and props.get('messageID') == message_id and props.get('error')):
             context['error'] = props['error']
 
     def open(self, method, path, body=None, timeout=15):
@@ -166,6 +166,7 @@ class NativeClient:
                     result.update(status='incomplete', incomplete_reason='dispatched_without_execution')
                     if error:
                         result['error'] = error
+                        result['error_attribution'] = 'explicit_message_id'
             return result  # Staging/initial idle without acknowledgement is never completion.
         latest = max(candidates, key=lambda item: item['info']['id'])
         info, parts = latest['info'], latest['parts']

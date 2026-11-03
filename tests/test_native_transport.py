@@ -38,6 +38,9 @@ class FakeProvider(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         self.server.requests.append(body)
+        if self.server.mode == 'delayed_headers':
+            self.server.request_started.set()
+            self.server.release.wait(30)
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.end_headers()
@@ -49,6 +52,9 @@ class FakeProvider(BaseHTTPRequestHandler):
             response = {'id': 'resp_fixture', 'object': 'response', 'created_at': 1, 'model': 'gpt-6-luna',
                         'status': 'in_progress', 'output': []}
             emit('response.created', response=response)
+            if self.server.mode == 'delayed_output':
+                self.server.request_started.set()
+                self.server.release.wait(30)
             if self.server.mode == 'wait':
                 self.server.release.wait(10)
             first = len(self.server.requests) == 1
@@ -95,6 +101,7 @@ class NativeServerTests(unittest.TestCase):
         self.provider.daemon_threads = True
         self.provider.requests, self.provider.mode, self.provider.release = [], 'text', threading.Event()
         self.provider.compaction_started = threading.Event()
+        self.provider.request_started = threading.Event()
         threading.Thread(target=self.provider.serve_forever, daemon=True).start()
         self.addCleanup(self.provider.server_close)
         self.addCleanup(self.provider.shutdown)
@@ -161,6 +168,64 @@ class NativeServerTests(unittest.TestCase):
         second = self.send('Explicit follow-up')
         self.assertNotEqual(first, second)
         self.assertEqual(self.client.wait(self.session, second, timeout=15)['status'], 'complete')
+
+    def test_native_delayed_provider_headers_and_output_survive_dispatch_grace(self):
+        """Real pinned native execution remains live through >10s of provider silence, without clock mocks."""
+        for mode in ('delayed_headers', 'delayed_output'):
+            with self.subTest(mode=mode):
+                self.provider.mode = mode
+                self.provider.release.clear()
+                self.provider.request_started.clear()
+                message = self.send('Fixture deliberately delayed provider ' + mode)
+                self.assertTrue(self.provider.request_started.wait(10))
+                # The provider holds before response headers, or before its first output item.
+                # This is actual elapsed time across the unmodified production grace period.
+                self.assertFalse(self.provider.release.wait(transport.DISPATCH_GRACE_SECONDS + 1))
+                result = self.client.snapshot(self.session, message)
+                self.assertEqual(result['status'], 'running', result)
+                self.assertEqual(result['native_status'], 'busy', result)
+                self.assertTrue(result['execution_observed'], result)
+                self.assertEqual(result['request_id'], message)
+                self.provider.release.set()
+                result = self.client.wait(self.session, message, timeout=15)
+                self.assertEqual(result['status'], 'complete', result)
+                self.assertEqual(result['text'], 'Fixture done')
+
+    def test_native_prior_session_error_observed_after_followup_ack_keeps_busy_work_running(self):
+        """Delay observer handling of a real old error; this is controlled delivery, not a native race claim."""
+        stream = self.client.events()
+        next(stream)
+        captured = []
+
+        def capture():
+            try:
+                for event in stream:
+                    if event.get('type') == 'session.error':
+                        captured.append(event)
+                        break
+            finally:
+                stream.close()
+
+        listener = threading.Thread(target=capture, daemon=True)
+        listener.start()
+        message, payload = self.client.stage(self.session, 'Fixture prior invalid model', 'openai/gpt-6-luna', 'high')
+        payload['model'] = {'providerID': 'fixture-missing-provider', 'modelID': 'fixture-missing-model'}
+        self.client.dispatch(self.session, message, payload)
+        listener.join(10)
+        self.assertFalse(listener.is_alive(), 'Native session.error was not captured')
+        self.assertEqual(len(captured), 1)
+        self.assertNotIn('messageID', captured[0]['properties'])
+        self.provider.mode = 'delayed_headers'
+        newer = self.send('Fixture newer request after native startup error')
+        self.assertTrue(self.provider.request_started.wait(10))
+        # This is an actual native event, deliberately processed after newer acknowledgement.
+        self.client.observe_dispatch(self.session, newer, captured[0])
+        result = self.client.snapshot(self.session, newer)
+        self.assertEqual(result['status'], 'running', result)
+        self.assertEqual(result['native_status'], 'busy', result)
+        self.assertNotIn('error', self.client.dispatch_context[(self.session, newer)])
+        self.provider.release.set()
+        self.assertEqual(self.client.wait(self.session, newer, timeout=15)['status'], 'complete')
 
     def test_native_auto_compaction_preserves_logical_request(self):
         fixture = self.project / 'fixture.txt'
@@ -346,7 +411,9 @@ class NativeServerTests(unittest.TestCase):
                 self.assertEqual(result['incomplete_reason'], 'dispatched_without_execution')
                 self.assertEqual(result['request_id'], receipt['request_id'])
                 dispatch.assert_called_once()
-            owner.join(15)
+            # Session-only errors now wait for grace expiry; owner heartbeat
+            # reconciliation and a subsequent idle-reap observation can each lag.
+            owner.join(30)
             self.assertFalse(owner.is_alive(), 'Failed idle native backend was not reaped')
             self.assertEqual(live.read(directory)['server_lifecycle'], 'stopped')
             self.assertEqual(live.status(directory)['incomplete_reason'], 'dispatched_without_execution')
@@ -498,7 +565,7 @@ class DispatchOutcomeTests(unittest.TestCase):
         """Ignore errors for other sessions/requests and never use an event as acknowledgement proof."""
         api = self.client()
         error = {'name': 'UnknownError', 'data': {'message': 'Fixture model resolution failure'}}
-        event = {'type': 'session.error', 'properties': {'sessionID': 'session', 'error': error}}
+        event = {'type': 'session.error', 'properties': {'sessionID': 'session', 'messageID': 'request', 'error': error}}
         api.observe_dispatch('session', 'request', event)
         with mock.patch.object(transport.time, 'time', return_value=100):
             self.assertEqual(api.snapshot('session', 'request')['status'], 'queued')
@@ -525,7 +592,7 @@ class DispatchOutcomeTests(unittest.TestCase):
                     """Advance wall time only after wait has reconciled its initial idle snapshot."""
                     yield {'type': 'server.connected'}
                     if observed_error:
-                        yield {'type': 'session.error', 'properties': {'sessionID': 'session',
+                        yield {'type': 'session.error', 'properties': {'sessionID': 'session', 'messageID': 'request',
                             'error': {'name': 'UnknownError'}}}
                     else:
                         clock.return_value = 100 + transport.DISPATCH_GRACE_SECONDS
@@ -671,7 +738,7 @@ class LiveBoundaryTests(unittest.TestCase):
                     'dispatch_status': 'confirmed' if acknowledged else 'pending', 'dispatch_confirmed_at': 100})
                 if with_error:
                     live.observe(self.directory, {'type': 'session.error',
-                        'properties': {'sessionID': 'native-fixture-session', 'error': error}})
+                        'properties': {'sessionID': 'native-fixture-session', 'messageID': 'request', 'error': error}})
                 # Build each client through the real factory, as separate CLI invocations do.
                 with mock.patch.object(live.NativeClient, 'messages_since', return_value=[]), \
                         mock.patch.object(live.NativeClient, 'questions', return_value=[]), \
