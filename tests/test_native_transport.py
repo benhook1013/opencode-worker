@@ -299,6 +299,61 @@ class NativeServerTests(unittest.TestCase):
         self.client.reply(self.session, question['id'], [['Proceed']])
         self.assertEqual(self.client.wait(self.session, message, timeout=15)['status'], 'complete')
 
+    def test_acknowledged_model_resolution_failure_does_not_wait_forever(self):
+        """Exercise a real asynchronous startup failure before assistant creation without a provider request."""
+        message, payload = self.client.stage(self.session, 'Fixture unresolved model', 'openai/gpt-6-luna', 'high')
+        payload['model'] = {'providerID': 'fixture-missing-provider', 'modelID': 'fixture-missing-model'}
+        self.client.dispatch(self.session, message, payload)
+        with mock.patch.object(transport, 'DISPATCH_GRACE_SECONDS', 0.1):
+            result = self.client.wait(self.session, message, timeout=15)
+        self.assertEqual(result['status'], 'incomplete', result)
+        self.assertEqual(result['incomplete_reason'], 'dispatched_without_execution')
+        self.assertFalse(result['execution_observed'])
+        self.assertEqual(result['request_id'], message)
+        self.assertEqual(self.provider.requests, [])
+
+    def test_managed_startup_failure_is_retained_and_idle_reaped_without_replay(self):
+        """Verify the real owner caches an acknowledged pre-execution failure and reaps its native server."""
+        self.stop()
+        directory = self.root / ('d' * 32)
+        directory.mkdir(mode=0o700)
+        live.atomic(directory / 'settings.json', self.settings)
+        (directory / 'server-auth').write_text('fixture-only-server-auth')
+        live.atomic(directory / 'metadata.json', {'backend': 'native-server', 'run_id': directory.name,
+            'worktree': str(self.project), 'model': 'openai/gpt-6-luna', 'reasoning': 'high',
+            'server_lifecycle': 'new', 'idle_reap_seconds': 0.1})
+        owner = multiprocessing.get_context('fork').Process(target=live.run_server, args=(directory,))
+        owner.start()
+        self.addCleanup(lambda: self.stop_owner(owner))
+        deadline = time.monotonic() + 15
+        while live.read(directory).get('server_lifecycle') != 'running':
+            self.assertLess(time.monotonic(), deadline, 'Managed fixture did not start')
+            time.sleep(0.05)
+        original_dispatch = live.NativeClient.dispatch
+
+        def unresolved(api, session, message, payload):
+            """Make only this disposable dispatch fail local model resolution after staging succeeds."""
+            payload['model'] = {'providerID': 'fixture-missing-provider', 'modelID': 'fixture-missing-model'}
+            return original_dispatch(api, session, message, payload)
+
+        with mock.patch.object(live.batch, 'STATE', self.root):
+            with live.batch.credit_lock():
+                live.batch.credit_save(False, None)
+            with mock.patch.object(live.NativeClient, 'dispatch', autospec=True, side_effect=unresolved) as dispatch:
+                receipt = live.send(directory, 'Fixture startup failure', 'startup-failure')
+                result = live.wait(directory)
+                self.assertEqual(result['status'], 'incomplete', result)
+                self.assertEqual(result['incomplete_reason'], 'dispatched_without_execution')
+                self.assertEqual(result['request_id'], receipt['request_id'])
+                dispatch.assert_called_once()
+            owner.join(15)
+            self.assertFalse(owner.is_alive(), 'Failed idle native backend was not reaped')
+            self.assertEqual(live.read(directory)['server_lifecycle'], 'stopped')
+            self.assertEqual(live.status(directory)['incomplete_reason'], 'dispatched_without_execution')
+            self.assertTrue(live.send(directory, 'Fixture startup failure', 'startup-failure')['already_submitted'])
+        self.assertEqual(self.provider.requests, [])
+        self.assertEqual(len(list(directory.glob('turn-*'))), 1)
+
     def test_native_cancel_keeps_request_identity(self):
         self.provider.mode = 'wait'
         message = self.send()
@@ -408,6 +463,80 @@ class NativeServerTests(unittest.TestCase):
         if process.is_alive():
             process.kill()
             process.join()
+
+
+class DispatchOutcomeTests(unittest.TestCase):
+    def client(self):
+        """Create an idle retained-session fixture with a staged user message and no assistant."""
+        api = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
+        api.messages_since = mock.Mock(return_value=[{'info': {'id': 'request', 'role': 'user'}, 'parts': []}])
+        api.questions = mock.Mock(return_value=[])
+        api.request = mock.Mock(return_value={})
+        return api
+
+    def test_initial_idle_requires_acknowledgement_and_post_dispatch_grace(self):
+        """Do not confuse staging, young dispatches, active work, or questions with missing execution."""
+        api = self.client()
+        with mock.patch.object(transport.time, 'time', return_value=1000):
+            self.assertEqual(api.snapshot('session', 'request')['status'], 'queued')
+        api.note_dispatch('session', 'request', 100)
+        with mock.patch.object(transport.time, 'time', return_value=100 + transport.DISPATCH_GRACE_SECONDS - 0.01):
+            self.assertEqual(api.snapshot('session', 'request')['status'], 'queued')
+        with mock.patch.object(transport.time, 'time', return_value=100 + transport.DISPATCH_GRACE_SECONDS):
+            result = api.snapshot('session', 'request')
+            self.assertEqual(result['status'], 'incomplete')
+            self.assertEqual(result['incomplete_reason'], 'dispatched_without_execution')
+            self.assertFalse(result['execution_observed'])
+            self.assertEqual(api.snapshot('other-session', 'request')['status'], 'queued')
+            api.request.return_value = {'session': {'type': 'busy'}}
+            self.assertEqual(api.snapshot('session', 'request')['status'], 'running')
+            api.request.return_value = {}
+            api.questions.return_value = [{'id': 'question'}]
+            self.assertEqual(api.snapshot('session', 'request')['status'], 'needs_input')
+
+    def test_matching_observed_error_shortens_grace_without_confirming_dispatch(self):
+        """Ignore errors for other sessions/requests and never use an event as acknowledgement proof."""
+        api = self.client()
+        error = {'name': 'UnknownError', 'data': {'message': 'Fixture model resolution failure'}}
+        event = {'type': 'session.error', 'properties': {'sessionID': 'session', 'error': error}}
+        api.observe_dispatch('session', 'request', event)
+        with mock.patch.object(transport.time, 'time', return_value=100):
+            self.assertEqual(api.snapshot('session', 'request')['status'], 'queued')
+            api.note_dispatch('session', 'request', 100)
+            for properties in ({'sessionID': 'other', 'error': error},
+                               {'sessionID': 'session', 'messageID': 'other', 'error': error}):
+                api.observe_dispatch('session', 'request', {'type': 'session.error', 'properties': properties})
+                self.assertEqual(api.snapshot('session', 'request')['status'], 'queued')
+            api.observe_dispatch('session', 'request', event)
+            result = api.snapshot('session', 'request')
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['error'], error)
+        self.assertFalse(result['execution_observed'])
+
+    def test_wait_returns_on_observed_error_or_expired_grace_without_redispatch(self):
+        """Bound an acknowledged empty request through both the event and retained-state wait paths."""
+        for observed_error in (False, True):
+            with self.subTest(observed_error=observed_error):
+                api = self.client()
+                api.note_dispatch('session', 'request', 100)
+                clock = mock.Mock(return_value=100)
+
+                def events():
+                    """Advance wall time only after wait has reconciled its initial idle snapshot."""
+                    yield {'type': 'server.connected'}
+                    if observed_error:
+                        yield {'type': 'session.error', 'properties': {'sessionID': 'session',
+                            'error': {'name': 'UnknownError'}}}
+                    else:
+                        clock.return_value = 100 + transport.DISPATCH_GRACE_SECONDS
+                        yield {'type': 'session.idle'}
+
+                with mock.patch.object(api, 'events', side_effect=events), \
+                        mock.patch.object(transport.time, 'time', clock), mock.patch.object(api, 'dispatch') as dispatch:
+                    result = api.wait('session', 'request')
+                self.assertEqual(result['status'], 'incomplete')
+                self.assertEqual(result['incomplete_reason'], 'dispatched_without_execution')
+                dispatch.assert_not_called()
 
 
 class EventReconciliationTests(unittest.TestCase):
@@ -526,6 +655,38 @@ class LiveBoundaryTests(unittest.TestCase):
                 live.send(self.directory, 'Fixture task', 'reaper-race')
             client.assert_not_called()
         self.assertEqual(list(self.directory.glob('turn-*')), [])
+
+    def test_status_and_late_wait_restore_acknowledgement_and_retained_session_error(self):
+        """Persist a matching startup failure while keeping uncertain dispatches blocked and inspectable."""
+        turn = self.directory / 'turn-fixture'
+        turn.mkdir()
+        (self.directory / 'server-auth').write_text('fixture-only')
+        error = {'name': 'UnknownError', 'data': {'message': 'Fixture startup failure'}}
+        for acknowledged, with_error in ((True, False), (True, True), (False, True)):
+            with self.subTest(acknowledged=acknowledged, with_error=with_error):
+                live.update(self.directory, server_url='http://127.0.0.1:1', server_lifecycle='running',
+                    current_request_id='request', latest_turn=turn.name, submitted_at=100,
+                    pending_dispatch=None if acknowledged else turn.name, current_result=None, session_error=None)
+                live.atomic(turn / 'receipt.json', {'request_id': 'request',
+                    'dispatch_status': 'confirmed' if acknowledged else 'pending', 'dispatch_confirmed_at': 100})
+                if with_error:
+                    live.observe(self.directory, {'type': 'session.error',
+                        'properties': {'sessionID': 'native-fixture-session', 'error': error}})
+                # Build each client through the real factory, as separate CLI invocations do.
+                with mock.patch.object(live.NativeClient, 'messages_since', return_value=[]), \
+                        mock.patch.object(live.NativeClient, 'questions', return_value=[]), \
+                        mock.patch.object(live.NativeClient, 'request', return_value={}), \
+                        mock.patch.object(live.time, 'time', return_value=110), \
+                        mock.patch.object(live.NativeClient, 'dispatch') as dispatch:
+                    for operation in (live.status, live.wait):
+                        result = operation(self.directory)
+                        self.assertEqual(result['status'], 'incomplete')
+                        if acknowledged:
+                            self.assertEqual(result['incomplete_reason'], 'dispatched_without_execution')
+                            self.assertEqual(result.get('error'), error if with_error else None)
+                        else:
+                            self.assertEqual(result['failure_reason'], 'dispatch_unconfirmed')
+                    dispatch.assert_not_called()
 
     def test_metadata_sync_failure_prevents_native_dispatch(self):
         """Fail the durable pending-dispatch metadata write before any native generation can start."""

@@ -102,7 +102,25 @@ def signal_owned(meta, kind, signum):
 def client(directory):
     meta = read(directory)
     password = (directory / 'server-auth').read_text()
-    return NativeClient(meta['server_url'], password, meta['worktree'])
+    api = NativeClient(meta['server_url'], password, meta['worktree'])
+    configure_dispatch(directory, api, meta)
+    return api
+
+
+def configure_dispatch(directory, api, meta):
+    """Restore request-specific acknowledgement context for owners and late-attaching observers."""
+    message, turn = meta.get('current_request_id'), meta.get('latest_turn')
+    if not message or not turn:
+        return
+    receipt = json.loads((directory / turn / 'receipt.json').read_text())
+    if receipt.get('request_id') != message or receipt.get('dispatch_status') != 'confirmed':
+        return
+    acknowledged_at = receipt.get('dispatch_confirmed_at', meta.get('submitted_at'))
+    if acknowledged_at is None:
+        return
+    observed = meta.get('session_error') or {}
+    error = observed.get('error') if observed.get('request_id') == message else None
+    api.note_dispatch(meta['session_id'], message, acknowledged_at, error)
 
 
 def confirm_dispatch(directory, meta, message, proof):
@@ -114,7 +132,8 @@ def confirm_dispatch(directory, meta, message, proof):
     receipt = json.loads(path.read_text())
     if receipt.get('request_id') != message:
         raise ValueError('Dispatch receipt identity mismatch; inspect retained state')
-    atomic(path, {**receipt, 'dispatch_status': 'confirmed', 'dispatch_confirmation': proof})
+    atomic(path, {**receipt, 'dispatch_status': 'confirmed', 'dispatch_confirmation': proof,
+                  'dispatch_confirmed_at': time.time()})
     meta['pending_dispatch'] = None
 
 
@@ -145,6 +164,13 @@ def observe(directory, event, record=False):
             output.write(json.dumps(event) + '\n')
     props = event.get('properties', {})
     error = props.get('error') or props.get('info', {}).get('error')
+    if event.get('type') == 'session.error' and error:
+        with locked(directory / 'metadata.lock'):
+            meta = read(directory)
+            message = meta.get('current_request_id')
+            if message and props.get('sessionID') == meta.get('session_id') and props.get('messageID', message) == message:
+                meta['session_error'] = {'request_id': message, 'error': error}
+                atomic(directory / 'metadata.json', meta)
     if error:
         reason = batch.exhaustion_reason(json.dumps({'type': 'error', 'error': error}))
         if reason:
@@ -222,6 +248,7 @@ def run_server(directory):
                             if not snapshot_due(event, last_snapshot):
                                 continue
                             message = meta.get('current_request_id')
+                            configure_dispatch(directory, api, meta)
                             result = api.snapshot(session, message) if message else None
                             last_snapshot = time.monotonic()
                             if result:
@@ -246,8 +273,10 @@ def run_server(directory):
                         update(directory, observer_state='degraded')
                         # Reconcile retained native state after transport loss; never replay a prompt.
                         try:
-                            if read(directory).get('current_request_id'):
-                                remember(directory, api.snapshot(session, read(directory)['current_request_id']))
+                            latest = read(directory)
+                            if latest.get('current_request_id'):
+                                configure_dispatch(directory, api, latest)
+                                remember(directory, api.snapshot(session, latest['current_request_id']))
                         except (OSError, ValueError):
                             pass  # Observation failure must not terminate healthy native work.
                         time.sleep(0.2)
@@ -367,7 +396,7 @@ def send(directory, task, submission_id=None):
             atomic(turn / 'receipt.json', {'request_id': message, 'session_id': meta['session_id'],
                 'submission_id': submission_id, 'task_sha256': fingerprint, 'stage_status': 'staged', 'dispatch_status': 'pending'})
             update(directory, current_request_id=message, latest_turn=turn.name, submitted_at=time.time(),
-                   current_result=None, pending_submission=None, pending_dispatch=turn.name, status='queued')
+                   current_result=None, session_error=None, pending_submission=None, pending_dispatch=turn.name, status='queued')
             try:
                 api.dispatch(meta['session_id'], message, payload)
             except OSError:

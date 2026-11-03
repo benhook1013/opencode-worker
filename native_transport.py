@@ -7,6 +7,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+DISPATCH_GRACE_SECONDS = 10
+
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, url):
@@ -64,6 +66,23 @@ class NativeClient:
         self.directory = str(directory)
         self.authorization = 'Basic ' + base64.b64encode(('opencode:' + password).encode()).decode()
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        self.dispatch_context = {}
+
+    def note_dispatch(self, session_id, message_id, acknowledged_at, error=None):
+        """Attach an acknowledgement and any observed session error to this exact request."""
+        context = self.dispatch_context.setdefault((session_id, message_id), {})
+        context['acknowledged_at'] = acknowledged_at
+        if error is not None:
+            context['error'] = error
+
+    def observe_dispatch(self, session_id, message_id, event):
+        """Retain matching session errors without treating an event as dispatch acknowledgement."""
+        props = event.get('properties', {})
+        context = self.dispatch_context.get((session_id, message_id))
+        if (context is not None and event.get('type') == 'session.error'
+                and props.get('sessionID') == session_id
+                and props.get('messageID', message_id) == message_id and props.get('error')):
+            context['error'] = props['error']
 
     def open(self, method, path, body=None, timeout=15):
         query = urllib.parse.urlencode({'directory': self.directory})
@@ -93,7 +112,9 @@ class NativeClient:
 
     def dispatch(self, session_id, message_id, payload):
         # The same native message ID is updated, not appended as a second user task.
-        return self.request('POST', f'/session/{session_id}/prompt_async', {**payload, 'messageID': message_id})
+        result = self.request('POST', f'/session/{session_id}/prompt_async', {**payload, 'messageID': message_id})
+        self.note_dispatch(session_id, message_id, time.time())
+        return result
 
     def questions(self, session_id):
         return [q for q in self.request('GET', '/question') if q['sessionID'] == session_id]
@@ -138,7 +159,14 @@ class NativeClient:
         if questions:
             result['status'] = 'needs_input'
         if not candidates:
-            return result  # Initial idle is not completion of the accepted request.
+            context = self.dispatch_context.get((session_id, message_id))
+            if not questions and native == 'idle' and context is not None:
+                error = context.get('error')
+                if error or time.time() - context['acknowledged_at'] >= DISPATCH_GRACE_SECONDS:
+                    result.update(status='incomplete', incomplete_reason='dispatched_without_execution')
+                    if error:
+                        result['error'] = error
+            return result  # Staging/initial idle without acknowledgement is never completion.
         latest = max(candidates, key=lambda item: item['info']['id'])
         info, parts = latest['info'], latest['parts']
         if not info.get('summary'):
@@ -198,6 +226,7 @@ class NativeClient:
                         return result
                     last_snapshot = time.monotonic()
                     for event in stream:
+                        self.observe_dispatch(session_id, message_id, event)
                         if observer:
                             observer(event)
                         if timeout is not None and time.monotonic() - started >= timeout:
