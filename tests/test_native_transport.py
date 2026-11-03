@@ -872,6 +872,79 @@ class CompactionLineageTests(unittest.TestCase):
             user('i', [{'type': 'text', 'synthetic': True, 'metadata': {'compaction_continue': True}}]),
             assistant('j', 'i', text='Actual delegated answer')]
 
+    def failed_compaction(self):
+        messages = self.messages()[:4]
+        messages[-1]['info'].update(finish=None, error={'name': 'APIError', 'data': {
+            'message': 'Insufficient fixture credits', 'statusCode': 429, 'isRetryable': False,
+            'responseHeaders': {}, 'responseBody': json.dumps({'error': {
+                'type': 'credit_balance_exhausted', 'code': 'credit_balance_exhausted'}}), 'metadata': {}}})
+        return messages
+
+    def snapshot(self, messages):
+        client = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
+        with mock.patch.object(client, 'messages_since', return_value=messages), mock.patch.object(client, 'request', side_effect=[[], {}, [], {}]):
+            return client.snapshot('native-fixture', 'a')
+
+    def test_owned_compaction_quota_error_is_failure_without_summary_text(self):
+        messages = self.failed_compaction()
+        result = self.snapshot(messages)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error'], messages[-1]['info']['error'])
+        self.assertEqual(result['request_id'], 'a')
+        self.assertEqual(result['text'], '')
+        self.assertTrue(result['execution_observed'])
+        self.assertNotIn('incomplete_reason', result)
+        self.assertEqual(worker.exhaustion_reason(json.dumps({'type': 'error', 'error': result['error']})), 'credit_balance_exhausted')
+
+    def test_failed_compaction_alone_does_not_manufacture_execution_confirmation(self):
+        messages = self.failed_compaction()
+        result = self.snapshot([messages[0], *messages[2:]])
+        self.assertEqual(result['status'], 'failed')
+        self.assertFalse(result['execution_observed'])
+        self.assertEqual(result['text'], '')
+
+    def test_unowned_compaction_error_cannot_replace_completed_handoff(self):
+        messages = self.failed_compaction()
+        messages[1] = self.assistant('b', 'a', text='Completed original handoff')
+        messages[2] = self.user('c', [{'type': 'text', 'text': 'Unrelated follow-up'}])
+        result = self.snapshot(messages)
+        self.assertEqual((result['status'], result['text']), ('complete', 'Completed original handoff'))
+        self.assertNotIn('error', result)
+        messages = self.failed_compaction()
+        messages[-1]['info']['parentID'] = 'foreign-compaction'
+        result = self.snapshot(messages)
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertNotIn('error', result)
+        self.assertEqual(result['text'], '')
+
+    def test_cached_compaction_failure_survives_status_wait_without_replay_or_credit_reset(self):
+        result = self.snapshot(self.failed_compaction())
+        with tempfile.TemporaryDirectory() as private:
+            root = Path(private)
+            directory = root / ('c' * 32)
+            directory.mkdir(mode=0o700)
+            (directory / 'turn-fixture').mkdir(mode=0o700)
+            with mock.patch.object(live.batch, 'STATE', root), mock.patch.object(live.batch.time, 'time', return_value=123):
+                with live.batch.credit_lock():
+                    live.batch.credit_save(True, 'credit_balance_exhausted')
+                guard_before = (root / 'credit-guard.json').read_bytes()
+                live.atomic(directory / 'metadata.json', {'session_id': 'native-fixture', 'current_request_id': 'a',
+                    'latest_turn': 'turn-fixture', 'status': 'failed', 'server_lifecycle': 'stopped', 'current_result': result})
+                with mock.patch.object(live, 'client', side_effect=AssertionError('no native access or dispatch')), mock.patch.object(live.batch, 'credit_preflight', side_effect=AssertionError('no new submission')):
+                    for read in (live.status, live.wait):
+                        observed = read(directory)
+                        self.assertEqual(observed['status'], 'failed')
+                        self.assertEqual(observed['error'], result['error'])
+                        self.assertEqual(observed['text'], '')
+                self.assertEqual((root / 'credit-guard.json').read_bytes(), guard_before)
+
+    def test_ordinary_compaction_rate_limit_does_not_become_credit_exhaustion(self):
+        messages = self.failed_compaction()
+        messages[-1]['info']['error']['data']['responseBody'] = json.dumps({'error': {'code': 'rate_limit_exceeded'}})
+        result = self.snapshot(messages)
+        self.assertEqual(result['status'], 'failed')
+        self.assertIsNone(worker.exhaustion_reason(json.dumps({'type': 'error', 'error': result['error']})))
+
     def test_repeated_native_compaction_keeps_request_and_excludes_summaries(self):
         messages = self.messages()
         candidates = transport.request_assistants(list(reversed(messages)), 'a')

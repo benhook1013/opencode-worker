@@ -44,8 +44,11 @@ def request_assistants(messages, message_id):
             last_user = info['id']
         elif info.get('role') == 'assistant':
             if info.get('summary'):
-                if info.get('parentID') in compactions and info.get('finish') == 'stop' and info.get('time', {}).get('completed') and not info.get('error'):
-                    completed_compactions.add(info['parentID'])
+                if info.get('parentID') in compactions:
+                    if info.get('error'):
+                        candidates.append(message)  # Owned compaction failure, never a final answer.
+                    elif info.get('finish') == 'stop' and info.get('time', {}).get('completed'):
+                        completed_compactions.add(info['parentID'])
                 continue  # A compaction summary is not the delegated task's final answer.
             if info.get('parentID') in parents:
                 candidates.append(message)
@@ -131,14 +134,15 @@ class NativeClient:
         candidates = request_assistants(messages, message_id)
         result = {'session_id': session_id, 'request_id': message_id, 'status': 'running' if native != 'idle' else 'queued',
                   'native_status': native, 'text': '', 'questions': questions,
-                  'execution_observed': bool(candidates)}
+                  'execution_observed': any(not item['info'].get('summary') for item in candidates)}
         if questions:
             result['status'] = 'needs_input'
         if not candidates:
             return result  # Initial idle is not completion of the accepted request.
         latest = max(candidates, key=lambda item: item['info']['id'])
         info, parts = latest['info'], latest['parts']
-        result['text'] = '\n\n'.join(p.get('text', '') for p in parts if p.get('type') == 'text')
+        if not info.get('summary'):
+            result['text'] = '\n\n'.join(p.get('text', '') for p in parts if p.get('type') == 'text')
         if questions:
             return result
         if info.get('error'):
