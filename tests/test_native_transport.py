@@ -1,5 +1,6 @@
 """Real pinned OpenCode against an isolated loopback fake Responses provider only."""
 import importlib.util
+import http.client
 import argparse
 import contextlib
 import io
@@ -607,6 +608,30 @@ class DispatchOutcomeTests(unittest.TestCase):
 
 
 class EventReconciliationTests(unittest.TestCase):
+    def test_truncated_event_stream_preserves_cause_and_wait_recovers(self):
+        """Normalize truncated HTTP streams and reconcile retained terminal state."""
+        client = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
+        error = http.client.IncompleteRead(b'partial')
+        def lines():
+            yield b'data: {"type": "server.connected"}\n'
+            yield b'\n'
+            raise error
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.side_effect = lines
+        with mock.patch.object(client, 'open', return_value=response):
+            stream = client.events()
+            self.assertEqual(next(stream), {'type': 'server.connected'})
+            with self.assertRaises(ConnectionError) as caught:
+                next(stream)
+            self.assertIs(caught.exception.__cause__, error)
+            response.__exit__.assert_called_once()
+            terminal = {'status': 'complete', 'text': 'retained'}
+            with mock.patch.object(client, 'snapshot', side_effect=[{'status': 'running'}, terminal]) as snapshot:
+                self.assertEqual(client.wait('session', 'request'), terminal)
+                self.assertEqual(snapshot.call_count, 2)
+
+
     def test_token_events_are_throttled_but_outcome_events_are_immediate(self):
         """Keep questions and completion responsive while rate-limiting delta and heartbeat snapshots."""
         with mock.patch.object(transport.time, 'monotonic', return_value=10.5):
@@ -1006,6 +1031,21 @@ class LiveBoundaryTests(unittest.TestCase):
                     self.assertEqual(start.call_args.args[0].allow_commands, route == '--allow-commands')
                     wait.assert_called_once_with(self.directory)
                     self.assertEqual(len(output.getvalue().splitlines()), 2)
+
+    def test_invalid_reasoning_is_rejected_before_worker_setup(self):
+        """Reject misspelled reasoning in batch and every managed route before side effects."""
+        for route in (['start'], ['run'], ['run', '--live'], ['run', '--allow-commands']):
+            for flag in (['--reasoning', 'hgih'], ['--variant', 'hgih'], ['--variant=hgih']):
+                with self.subTest(route=route, flag=flag), \
+                        mock.patch.object(router.live, 'start') as start, \
+                        mock.patch.object(router.live.batch, 'private_dir') as private_dir, \
+                        contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit) as caught:
+                    router.main([*route, '--task-file', 'fixture-task', '--worktree', str(self.project),
+                                 '--model', 'openai/gpt-6-luna', *flag])
+                self.assertEqual(caught.exception.code, 2)
+                start.assert_not_called()
+                private_dir.assert_not_called()
 
     def test_wait_cursor_cannot_report_an_old_request_as_new_completion(self):
         live.atomic(self.directory / 'metadata.json', {'current_request_id': 'native-old', 'session_id': 'native-session'})

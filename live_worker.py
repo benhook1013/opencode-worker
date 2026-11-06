@@ -619,7 +619,7 @@ def main(argv=None):
     new = sub.add_parser('start')
     for flag in ('task-file', 'worktree', 'model'):
         new.add_argument('--' + flag, required=True)
-    new.add_argument('--reasoning', '--variant', required=True)
+    new.add_argument('--reasoning', '--variant', required=True, choices=batch.REASONING_CHOICES)
     new.add_argument('--wait', action='store_true', help='Print the start receipt, then block on native events')
     new.add_argument('--worker-id', type=batch.run_id, help='Optional stable ID: exactly 32 lowercase hexadecimal characters (for example, 0123456789abcdef0123456789abcdef); omit to generate one. The same initial assignment is not replayed')
     new.add_argument('--submission-id', help='Owner-supplied idempotency key for this task')

@@ -1,5 +1,6 @@
 """Thin authenticated loopback HTTP/SSE transport; OpenCode owns all agent execution."""
 import base64
+import http.client
 import json
 import socket
 import time
@@ -203,13 +204,16 @@ class NativeClient:
     def events(self):
         with self.open('GET', '/event', timeout=45) as response:
             data = []
-            for raw in response:
-                line = raw.decode().rstrip('\r\n')
-                if line.startswith('data:'):
-                    data.append(line[5:].lstrip())
-                elif not line and data:
-                    yield json.loads('\n'.join(data))
-                    data = []
+            try:
+                for raw in response:
+                    line = raw.decode().rstrip('\r\n')
+                    if line.startswith('data:'):
+                        data.append(line[5:].lstrip())
+                    elif not line and data:
+                        yield json.loads('\n'.join(data))
+                        data = []
+            except http.client.HTTPException as error:
+                raise ConnectionError(f'Native event stream ended: {error!r}') from error
 
     def wait(self, session_id, message_id, observer=None, timeout=None):
         started = time.monotonic()

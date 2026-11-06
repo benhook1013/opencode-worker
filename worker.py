@@ -16,6 +16,8 @@ import time
 import tempfile
 import uuid
 
+REASONING_CHOICES = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh')
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -439,7 +441,7 @@ def main():
     run = commands.add_parser('run', help='Start a fresh native OpenCode session from an explicit task')
     run.add_argument('--worktree', required=True)
     run.add_argument('--model', required=True, help='Actual OpenAI API model ID; no fallback')
-    run.add_argument('--reasoning', '--variant', required=True, dest='reasoning', choices=['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+    run.add_argument('--reasoning', '--variant', required=True, dest='reasoning', choices=REASONING_CHOICES)
     run.add_argument('--allow-write', action='store_true', help='Enable native edit tools; default is read-only policy')
     resume = commands.add_parser('resume', help='Continue only the named native session with a new explicit task')
     resume.add_argument('run_id')
