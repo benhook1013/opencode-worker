@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+base=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -f "$base/share/api-worker/cli_router.py" ]; then
+    base="$base/share/api-worker"
+fi
+exec python3 -I "$base/cli_router.py" "$@"

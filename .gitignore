@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+node_modules/
+.venv/
+.env
+.env.*
+/state/
+/config/
+*.log
+packaging-source-sha256.json
