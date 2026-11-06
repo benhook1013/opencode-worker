@@ -511,7 +511,8 @@ def start(args):
         'write': args.allow_write, 'commands': args.allow_commands, 'long_context': args.long_context,
         'steps': steps, 'output': budget, 'limits': limits, 'timeout': args.timeout}, sort_keys=True).encode()).hexdigest()
     directory = batch.STATE / (args.worker_id or spec[:32])
-    if directory.exists():
+    metadata = directory / 'metadata.json'
+    if metadata.exists() or metadata.is_symlink():
         previous = read(directory)
         if previous.get('backend') != 'native-server' or previous.get('start_spec_sha256') != spec:
             raise ValueError('Worker ID already exists with a different initial assignment; nothing was replayed')
@@ -522,6 +523,11 @@ def start(args):
         return {'run_id': directory.name, 'session_id': previous.get('session_id'),
                 'request_id': previous.get('current_request_id'), 'status': previous.get('status', 'starting'), 'already_submitted': True}
     batch.private_dir(directory)
+    # Older wait commands could leave a control lock before initialization.
+    for entry in directory.iterdir():
+        initialization_file = entry.name in ('settings.json', 'server-auth', 'control.lock') or entry.name.startswith('.receipt-')
+        if not initialization_file or entry.is_symlink() or not entry.is_file():
+            raise ValueError('Worker has retained state without metadata. Inspect it before starting work.')
     settings = batch.config(model, args.reasoning, args.allow_write, steps, key=batch.KEY, worktree=worktree, limits=limits)
     settings = live_settings(settings, allow_commands=args.allow_commands, long_context=args.long_context,
                              shell_plugin=(ROOT / 'command_environment.js').as_uri())
@@ -637,12 +643,15 @@ def main(argv=None):
             item.add_argument('--question-id', required=True)
             item.add_argument('--answers-file', required=True, help='JSON file containing one array of selected answer strings per question, for example [["Proceed"]]')
     args = parser.parse_args(argv)
-    batch.private_dir(batch.STATE)
     if args.action == 'start':
+        batch.private_dir(batch.STATE)
         with locked(batch.STATE / 'start.lock'):
             result = start(args)
     else:
         directory = batch.STATE / args.run_id
+        if not (directory / 'metadata.json').is_file():
+            raise ValueError(f'Unknown worker ID: {args.run_id}')
+        batch.private_dir(batch.STATE)
         batch.private_dir(directory)
         if args.action in ('send', 'resume'):
             configure_idle(directory, args)

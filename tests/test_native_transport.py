@@ -723,6 +723,58 @@ class LiveBoundaryTests(unittest.TestCase):
             client.assert_not_called()
         self.assertEqual(list(self.directory.glob('turn-*')), [])
 
+    def test_unknown_live_commands_leave_no_worker_directory(self):
+        """Reject a missing worker before creating state or attempting native actions."""
+        identifier = 'e' * 32
+        commands = [('wait', []), ('cancel', []), ('shutdown', []),
+                    ('send', ['--task-file', 'unused']),
+                    ('reply', ['--question-id', 'unused', '--answers-file', 'unused'])]
+        for action, options in commands:
+            with self.subTest(action=action), mock.patch.object(router.live.batch, 'STATE', self.root):
+                with self.assertRaisesRegex(ValueError, 'Unknown worker ID'):
+                    router.main([action, identifier, *options])
+                self.assertFalse((self.root / identifier).exists())
+
+    def test_start_recovers_partial_initialization_but_preserves_retained_work(self):
+        """Retry initialization after a failed metadata write and protect existing turn artifacts."""
+        task = self.root / 'initial.txt'
+        task.write_text('Fixture initial task')
+        key = self.root / 'dummy-key'
+        key.write_text('fixture-only')
+        key.chmod(0o600)
+        args = argparse.Namespace(task_file=str(task), worktree=str(self.project), model='openai/gpt-6-luna', reasoning='high',
+            allow_write=False, allow_commands=False, long_context=False, max_steps=None, max_output_tokens=None,
+            context_window=None, model_output_limit=None, timeout=None, worker_id='d' * 32, submission_id='initial')
+        directory = self.root / args.worker_id
+        directory.mkdir(mode=0o700)
+        (directory / 'control.lock').touch()  # Left by an older wait on an unknown ID.
+        atomic = live.atomic
+
+        def interrupted(path, value):
+            if path.name == 'metadata.json':
+                raise OSError('fixture interrupted initialization')
+            atomic(path, value)
+
+        with mock.patch.object(live.batch, 'KEY', key), mock.patch.object(live, 'send') as send:
+            with mock.patch.object(live, 'atomic', side_effect=interrupted):
+                with self.assertRaisesRegex(OSError, 'interrupted initialization'):
+                    live.start(args)
+            send.assert_not_called()
+            self.assertTrue((directory / 'settings.json').is_file())
+            self.assertFalse((directory / 'metadata.json').exists())
+            live.start(args)
+            send.assert_called_once_with(directory, 'Fixture initial task', 'initial')
+            self.assertEqual(live.read(directory)['status'], 'starting')
+            args.worker_id = 'e' * 32
+            retained = self.root / args.worker_id / 'turn-retained'
+            retained.mkdir(mode=0o700, parents=True)
+            (retained.parent).chmod(0o700)
+            with self.assertRaisesRegex(ValueError, 'retained state without metadata'):
+                live.start(args)
+            self.assertTrue(retained.is_dir())
+            self.assertFalse((retained.parent / 'metadata.json').exists())
+            send.assert_called_once()
+
     def test_status_and_late_wait_restore_acknowledgement_and_retained_session_error(self):
         """Persist a matching startup failure while keeping uncertain dispatches blocked and inspectable."""
         turn = self.directory / 'turn-fixture'

@@ -234,11 +234,14 @@ def run_id(value):
 
 
 def collect(events):
+    """Collect batch result text, session identity, and error presence from object events."""
     texts, sessions, errors = [], [], []
     for line in events.splitlines():
         try:
             event = json.loads(line)
         except ValueError:
+            continue
+        if not isinstance(event, dict):
             continue
         if event.get('sessionID'):
             sessions.append(event['sessionID'])

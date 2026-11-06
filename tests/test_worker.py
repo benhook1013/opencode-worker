@@ -6,6 +6,7 @@ import io
 import json
 import multiprocessing
 import stat
+import sys
 from unittest import mock
 from pathlib import Path
 import tempfile
@@ -73,7 +74,7 @@ class LauncherTests(unittest.TestCase):
                     launch.assert_not_called()
 
     def test_native_event_result_collection(self):
-        events = '\n'.join(['{"type":"text","sessionID":"ses_fixture","part":{"text":"done"}}',
+        events = '\n'.join(['42', 'null', '[]', '{"type":"text","sessionID":"ses_fixture","part":{"text":"done"}}',
                             '{"type":"error","sessionID":"ses_fixture","error":{"name":"fixture"}}'])
         self.assertEqual(worker.collect(events), ('done', 'ses_fixture', True))
         with self.assertRaises(ValueError): worker.run_id('../escape')
@@ -162,7 +163,7 @@ class CreditGuardTests(unittest.TestCase):
         key.write_text('fixture-only')
         key.chmod(0o600)
         binary = self.root / 'fake-opencode'
-        binary.write_text('#!/usr/bin/python3\nimport sys\nsys.stdin.read()\nprint(' + repr(self.error('credit_balance_exhausted')) + ')\n')
+        binary.write_text(f'#!{sys.executable}\nimport sys\nsys.stdin.read()\nprint(' + repr(self.error('credit_balance_exhausted')) + ')\n')
         binary.chmod(0o700)
         args = argparse.Namespace(action='run', model='openai/gpt-6-luna', worktree=str(project),
             task_file=str(task), reasoning='high', allow_write=False, max_steps=None, timeout=None)
@@ -234,7 +235,7 @@ class CreditGuardTests(unittest.TestCase):
         key.write_text('fixture-only')
         key.chmod(0o600)
         binary = self.root / 'fake-opencode'
-        binary.write_text('#!/usr/bin/python3\nimport sys,os,json\nsys.stdin.read()\n'
+        binary.write_text(f'#!{sys.executable}\nimport sys,os,json\nsys.stdin.read()\n'
             'settings=json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])\n'
             'model=settings["model"].split("/",1)[1]\n'
             'assert settings["provider"]["openai"]["models"][model]["limit"] == {"context":1050000,"output":128000,"input":1050000}\n'

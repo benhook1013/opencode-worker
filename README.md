@@ -7,11 +7,10 @@ Linux/WSL x86_64 CLI for delegated tasks using native OpenCode sessions. Require
 ```sh
 npm ci --prefix runtime
 python3 install.py --prefix "$HOME/.local"
-# Add the prefix's bin directory to PATH yourself, or invoke it by absolute path.
-api-worker doctor --offline
+"$HOME/.local/bin/api-worker" doctor --offline
 ```
 
-The installer copies this checkout and its prepared runtime into `PREFIX/share/api-worker` and puts the launcher in `PREFIX/bin/api-worker`. Install only under a trusted, user-controlled prefix; shared prefixes writable by untrusted users are unsupported. The prefix must resolve outside the source `runtime` directory, including through symlink aliases. It refuses existing destinations; there is no automatic upgrade or cutover. Choose a fresh prefix for testing or side-by-side installation. `bin/api-worker` also runs directly from the prepared checkout. The Python code uses only the standard library.
+The installer copies this checkout and its prepared runtime into `PREFIX/share/api-worker` and puts the launcher in `PREFIX/bin/api-worker`. Install only under a trusted, user-controlled prefix. Shared prefixes writable by untrusted users are unsupported. Both the prefix and its `share` directory must resolve outside the source `runtime` directory. Choose a fresh prefix for testing or side-by-side installation. The installer refuses existing destinations. `bin/api-worker` also runs directly from the prepared checkout. The Python code uses only the standard library.
 
 Config defaults to `${XDG_CONFIG_HOME:-$HOME/.config}/api-worker`; state defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/api-worker`. Explicit absolute `API_WORKER_CONFIG_DIR` and `API_WORKER_STATE_DIR` override those directories. The runtime is resolved relative to the installed source, not the current directory. A different prefix alone does **not** isolate state; set separate state/config directories when testing or running independent installations. Existing records can remain in place; no automatic migration or replay occurs. Do not upgrade source beneath running owners.
 

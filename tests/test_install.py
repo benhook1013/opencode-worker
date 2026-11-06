@@ -92,7 +92,10 @@ class InstallTests(unittest.TestCase):
             binary.write_text('fixture')
             alias = root / 'runtime-alias'
             alias.symlink_to(runtime, target_is_directory=True)
-            for prefix in (runtime, runtime / 'nested/prefix', alias, alias / 'nested/prefix'):
+            external = root / 'external-prefix'
+            external.mkdir()
+            (external / 'share').symlink_to(runtime / 'node_modules', target_is_directory=True)
+            for prefix in (runtime, runtime / 'nested/prefix', alias, alias / 'nested/prefix', external):
                 with self.subTest(prefix=prefix), mock.patch.object(installer, 'SOURCE', runtime.parent), \
                         mock.patch.object(Path, 'mkdir') as mkdir, \
                         mock.patch.object(installer.shutil, 'copytree') as copytree:
