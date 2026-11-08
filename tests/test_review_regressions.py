@@ -176,6 +176,32 @@ class ReviewRegressions(unittest.TestCase):
             kill.assert_called_once_with(process.pid, signal.SIGTERM)
             process.wait.assert_called_once()
 
+    def test_local_hook_dependencies_are_prepared_offline_and_reusable(self):
+        settings = {'plugin': [(worker.ROOT / 'command_environment.js').as_uri()]}
+        with mock.patch.object(worker.subprocess, 'Popen', side_effect=AssertionError('No package install at startup')):
+            first = worker.environment(self.directory, settings)
+            second = worker.environment(self.directory, settings)
+        config = Path(first['XDG_CONFIG_HOME']) / 'opencode'
+        self.assertEqual(first, second)
+        self.assertEqual((config / 'node_modules').resolve(), (worker.ROOT / 'runtime/node_modules').resolve())
+        manifest = json.loads((config / 'package.json').read_text())
+        lock = json.loads((config / 'package-lock.json').read_text())
+        self.assertEqual(manifest['dependencies']['@opencode-ai/plugin'], worker.VERSION)
+        self.assertEqual(lock['packages']['']['dependencies'], manifest['dependencies'])
+        self.assertNotIn('HTTPS_PROXY', first)
+
+    def test_local_hook_missing_dependency_fails_before_native_launch(self):
+        with mock.patch.object(worker, 'ROOT', self.root):
+            with self.assertRaisesRegex(ValueError, 'npm ci --prefix runtime'):
+                worker.environment(self.directory, {'plugin': ['file:///fixture.js']})
+
+    def test_local_hook_rejects_unexpected_dependency_link(self):
+        config = self.directory / 'home/config/opencode'
+        config.mkdir(parents=True)
+        (config / 'node_modules').symlink_to(self.root)
+        with self.assertRaisesRegex(ValueError, 'Unexpected plugin dependency link'):
+            worker.environment(self.directory, {'plugin': ['file:///fixture.js']})
+
     def test_shutdown_publishes_intent_before_abort(self):
         api = mock.Mock()
         api.abort.side_effect = lambda session: self.assertTrue(live.read(self.directory)['stop_requested'])

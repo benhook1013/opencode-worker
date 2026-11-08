@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import resource
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -114,6 +115,27 @@ def environment(directory, settings, max_output_tokens=None):
     # No inherited API keys, OAuth, proxy settings, telemetry, config overrides, or shell initialization.
     home = directory / 'home'
     private_dir(home)
+    if settings.get('plugin'):
+        # OpenCode installs its plugin SDK into each config directory before loading
+        # even local hooks. Seed its locked dependencies offline: sanitized workers
+        # deliberately cannot inherit package-registry credentials or proxy settings.
+        runtime = ROOT / 'runtime'
+        plugin = runtime / 'node_modules/@opencode-ai/plugin/package.json'
+        if not plugin.is_file() or json.loads(plugin.read_text()).get('version') != VERSION:
+            raise ValueError('Prepare pinned plugin dependencies: npm ci --prefix runtime')
+        config_home = home / 'config/opencode'
+        private_dir(config_home)
+        for name in ('package.json', 'package-lock.json'):
+            shutil.copyfile(runtime / name, config_home / name)
+        modules = config_home / 'node_modules'
+        expected = (runtime / 'node_modules').resolve()
+        if modules.is_symlink():
+            if modules.resolve() != expected:
+                raise ValueError('Unexpected plugin dependency link in worker config')
+        elif modules.exists():
+            raise ValueError('Unexpected plugin dependency directory in worker config')
+        else:
+            modules.symlink_to(expected, target_is_directory=True)
     env = {'HOME': str(home), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'SHELL': '/bin/sh',
            'XDG_CONFIG_HOME': str(home / 'config'), 'XDG_DATA_HOME': str(home / 'data'),
            'XDG_STATE_HOME': str(home / 'state'), 'XDG_CACHE_HOME': str(home / 'cache'),
