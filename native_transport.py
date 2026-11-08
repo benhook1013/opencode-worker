@@ -68,6 +68,8 @@ class NativeClient:
         self.authorization = 'Basic ' + base64.b64encode(('opencode:' + password).encode()).decode()
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         self.dispatch_context = {}
+        self.deadline = None
+        self.idle_unfinished = {}
 
     def note_dispatch(self, session_id, message_id, acknowledged_at, error=None):
         """Attach an acknowledgement and any observed session error to this exact request."""
@@ -91,12 +93,20 @@ class NativeClient:
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(url, data=data, method=method, headers={
             'Authorization': self.authorization, 'Content-Type': 'application/json'})
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Native observation deadline expired')
+            timeout = min(timeout, remaining)
         return self.opener.open(request, timeout=timeout)
 
     def request(self, method, path, body=None):
-        with self.open(method, path, body) as response:
-            data = response.read()
-            return json.loads(data) if data else None
+        try:
+            with self.open(method, path, body) as response:
+                data = response.read()
+                return json.loads(data) if data else None
+        except (http.client.HTTPException, UnicodeError, json.JSONDecodeError) as error:
+            raise ConnectionError('Native JSON response was incomplete or invalid') from error
 
     def create_session(self, title='Delegated worker'):
         return self.request('POST', '/session', {'title': title})['id']
@@ -132,9 +142,12 @@ class NativeClient:
         path = f'/session/{session_id}/message?limit=100'
         messages, seen = {}, set()
         while True:
-            with self.open('GET', path) as response:
-                page = json.load(response)
-                cursor = response.headers.get('X-Next-Cursor')
+            try:
+                with self.open('GET', path) as response:
+                    page = json.load(response)
+                    cursor = response.headers.get('X-Next-Cursor')
+            except (http.client.HTTPException, UnicodeError, json.JSONDecodeError) as error:
+                raise ConnectionError('Native message response was incomplete or invalid') from error
             messages.update((message['info']['id'], message) for message in page)
             if message_id in messages or not cursor:
                 return list(messages.values())
@@ -144,6 +157,7 @@ class NativeClient:
             path = f'/session/{session_id}/message?limit=100&before=' + urllib.parse.quote(cursor, safe='')
 
     def snapshot(self, session_id, message_id):
+        observed_at_ns = time.monotonic_ns()
         messages = self.messages_since(session_id, message_id)
         questions = self.questions(session_id)
         native = self.request('GET', '/session/status').get(session_id, {'type': 'idle'})['type']
@@ -155,7 +169,7 @@ class NativeClient:
             native = self.request('GET', '/session/status').get(session_id, {'type': 'idle'})['type']
         candidates = request_assistants(messages, message_id)
         result = {'session_id': session_id, 'request_id': message_id, 'status': 'running' if native != 'idle' else 'queued',
-                  'native_status': native, 'text': '', 'questions': questions,
+                  'native_status': native, 'text': '', 'questions': questions, 'observed_at_ns': observed_at_ns,
                   'execution_observed': any(not item['info'].get('summary') for item in candidates)}
         if questions:
             result['status'] = 'needs_input'
@@ -181,11 +195,23 @@ class NativeClient:
             return result
         finish = info.get('finish')
         result['finish_reason'] = finish
+        key = (session_id, message_id)
         if not info.get('time', {}).get('completed'):
+            if native == 'idle':
+                signature = json.dumps(latest, sort_keys=True)
+                previous = self.idle_unfinished.get(key)
+                if previous is None or previous[0] != signature:
+                    self.idle_unfinished[key] = (signature, time.monotonic())
+                elif time.monotonic() - previous[1] >= DISPATCH_GRACE_SECONDS:
+                    result.update(status='incomplete', incomplete_reason='idle_unfinished_assistant')
+            else:
+                self.idle_unfinished.pop(key, None)
             return result
+        self.idle_unfinished.pop(key, None)
         tools = [p.get('state', {}) for p in parts if p.get('type') == 'tool']
         if finish == 'length':
-            result.update(status='incomplete', incomplete_reason='output_limit_reached')
+            if native == 'idle':
+                result.update(status='incomplete', incomplete_reason='output_limit_reached')
         elif any(s.get('status') in ('pending', 'running') for s in tools):
             if native == 'idle':
                 result.update(status='incomplete', incomplete_reason='unfinished_tool_call')
@@ -201,11 +227,13 @@ class NativeClient:
             result.update(status='incomplete', incomplete_reason='missing_terminal_text_or_stop')
         return result
 
-    def events(self):
-        with self.open('GET', '/event', timeout=45) as response:
+    def events(self, timeout=45):
+        with self.open('GET', '/event', timeout=min(timeout, 1) if self.deadline else timeout) as response:
             data = []
             try:
                 for raw in response:
+                    if self.deadline is not None and time.monotonic() >= self.deadline:
+                        raise TimeoutError('Native observation deadline expired')
                     line = raw.decode().rstrip('\r\n')
                     if line.startswith('data:'):
                         data.append(line[5:].lstrip())
@@ -216,14 +244,19 @@ class NativeClient:
                 raise ConnectionError(f'Native event stream ended: {error!r}') from error
 
     def wait(self, session_id, message_id, observer=None, timeout=None):
-        started = time.monotonic()
+        old_deadline = self.deadline
+        self.deadline = time.monotonic() + timeout if timeout is not None else None
         terminal = {'complete', 'incomplete', 'failed', 'interrupted', 'needs_input'}
-        # Connect before snapshot so a completion between attach and snapshot is retained.
-        while True:
-            try:
-                stream = self.events()
-                next(stream)  # Native server.connected establishes the SSE subscription.
+        result = {'session_id': session_id, 'request_id': message_id, 'status': 'running'}
+        try:
+            while True:
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    return {**result, 'wait_timed_out': True}
+                stream = None
                 try:
+                    stream = self.events()
+                    if next(stream, None) is None:
+                        raise ConnectionError('Native event stream closed before subscription')
                     result = self.snapshot(session_id, message_id)
                     if observer:
                         observer(result)
@@ -231,27 +264,33 @@ class NativeClient:
                         return result
                     last_snapshot = time.monotonic()
                     for event in stream:
+                        if self.deadline is not None and time.monotonic() >= self.deadline:
+                            return {**result, 'wait_timed_out': True}
                         self.observe_dispatch(session_id, message_id, event)
                         if observer:
                             observer(event)
-                        if timeout is not None and time.monotonic() - started >= timeout:
-                            return {**result, 'wait_timed_out': True}
                         if not snapshot_due(event, last_snapshot):
                             continue
-                        # Reconcile retained native state; no replay on transport reconnect.
                         result = self.snapshot(session_id, message_id)
                         last_snapshot = time.monotonic()
                         if result['status'] in terminal:
                             if observer:
                                 observer(result)
                             return result
+                    raise ConnectionError('Native event stream closed')
+                except (ConnectionError, socket.timeout, urllib.error.URLError):
+                    if self.deadline is not None and time.monotonic() >= self.deadline:
+                        return {**result, 'wait_timed_out': True}
+                    result = self.snapshot(session_id, message_id)
+                    if result['status'] in terminal:
+                        return result
+                    remaining = self.deadline - time.monotonic() if self.deadline else 0.2
+                    time.sleep(max(0, min(0.2, remaining)))
                 finally:
-                    stream.close()
-            except (ConnectionError, socket.timeout, urllib.error.URLError):
-                result = self.snapshot(session_id, message_id)  # Raises if the backend is gone.
-                if result['status'] in terminal:
-                    return result
-                time.sleep(0.2)
+                    if stream is not None:
+                        stream.close()
+        finally:
+            self.deadline = old_deadline
 
 
 def live_settings(settings, *, allow_commands=False, long_context=False, shell_plugin=None):

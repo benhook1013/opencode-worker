@@ -132,7 +132,22 @@ def environment(directory, settings, max_output_tokens=None):
 
 
 def save(path, value):
-    path.write_text(json.dumps(value, indent=2) + '\n')
+    fd, filename = tempfile.mkstemp(prefix='.receipt-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(value, handle, indent=2)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(filename, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(filename):
+            os.unlink(filename)
 
 
 
@@ -335,44 +350,43 @@ def incomplete_reason(events):
 def execute(args):
     with credit_lock():
         credit_preflight()
-    if args.action == 'run':
-        model = args.model if args.model.startswith('openai/') else 'openai/' + args.model
-        if not re.fullmatch(r'openai/[A-Za-z0-9][A-Za-z0-9._-]*', model):
-            raise ValueError('Model must be an explicit OpenAI model ID, optionally prefixed openai/')
-        worktree = validate_worktree(args.worktree)
-        directory = STATE / uuid.uuid4().hex
-        meta = {'run_id': directory.name, 'worktree': str(worktree), 'model': model,
-                'reasoning': args.reasoning, 'allow_write': args.allow_write}
-    else:
-        directory = STATE / run_id(args.run_id)
-        meta = json.loads((directory / 'metadata.json').read_text())
-        if not meta.get('session_id'):
-            raise ValueError('No native session ID recorded; inspect artifacts before starting another run')
-        worktree = validate_worktree(meta['worktree'])
-    limits = model_limits(meta['model'], args, meta)
-    budget = output_budget(args, meta, limits)
-    steps = step_limit(args, meta)
-    timeout = getattr(args, 'timeout', None)
-    if timeout is not None and timeout < 0:
-        raise ValueError('Timeout must be positive, or 0 for unlimited wall clock')
-    timeout = timeout or None
-    explicit_limits = bool(meta.get('model_limits_explicit') or getattr(args, 'context_window', None) or getattr(args, 'model_output_limit', None))
-    meta.update(model_limits=limits, model_limits_explicit=explicit_limits,
-                max_output_tokens=budget if budget is not None else min(limits['output'], NATIVE_OUTPUT_TOKENS),
-                output_limit_explicit=budget is not None, steps=steps, steps_explicit=steps is not None, timeout_seconds=timeout)
-    long_context = getattr(args, 'long_context', None)
-    meta['long_context'] = meta.get('long_context', False) if long_context is None else long_context
-    meta.pop('incomplete_reason', None)
-    task = Path(args.task_file).read_text()
-    if not task.strip():
-        raise ValueError('Task file is empty')
-    credential_check(KEY)
+    directory = STATE / (uuid.uuid4().hex if args.action == 'run' else run_id(args.run_id))
     private_dir(directory)
     with (directory / 'lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError('This run already has an active OpenCode process') from None
+        if args.action == 'run':
+            model = args.model if args.model.startswith('openai/') else 'openai/' + args.model
+            if not re.fullmatch(r'openai/[A-Za-z0-9][A-Za-z0-9._-]*', model):
+                raise ValueError('Model must be an explicit OpenAI model ID, optionally prefixed openai/')
+            worktree = validate_worktree(args.worktree)
+            meta = {'run_id': directory.name, 'worktree': str(worktree), 'model': model,
+                    'reasoning': args.reasoning, 'allow_write': args.allow_write}
+        else:
+            meta = json.loads((directory / 'metadata.json').read_text())
+            if not meta.get('session_id'):
+                raise ValueError('No native session ID recorded; inspect artifacts before starting another run')
+            worktree = validate_worktree(meta['worktree'])
+        limits = model_limits(meta['model'], args, meta)
+        budget = output_budget(args, meta, limits)
+        steps = step_limit(args, meta)
+        timeout = getattr(args, 'timeout', None)
+        if timeout is not None and timeout < 0:
+            raise ValueError('Timeout must be positive, or 0 for unlimited wall clock')
+        timeout = timeout or None
+        explicit_limits = bool(meta.get('model_limits_explicit') or getattr(args, 'context_window', None) or getattr(args, 'model_output_limit', None))
+        meta.update(model_limits=limits, model_limits_explicit=explicit_limits,
+                    max_output_tokens=budget if budget is not None else min(limits['output'], NATIVE_OUTPUT_TOKENS),
+                    output_limit_explicit=budget is not None, steps=steps, steps_explicit=steps is not None, timeout_seconds=timeout)
+        long_context = getattr(args, 'long_context', None)
+        meta['long_context'] = meta.get('long_context', False) if long_context is None else long_context
+        meta.pop('incomplete_reason', None)
+        task = Path(args.task_file).read_text()
+        if not task.strip():
+            raise ValueError('Task file is empty')
+        credential_check(KEY)
         turn = directory / ('turn-' + uuid.uuid4().hex)
         private_dir(turn)
         (turn / 'task.txt').write_text(task)
@@ -390,8 +404,19 @@ def execute(args):
                 credit_preflight()
                 meta.update(status='running', latest_turn=turn.name, started_at=time.time())
                 save(directory / 'metadata.json', meta)
-                proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=error,
-                                        cwd=worktree, env=env, start_new_session=True)
+                try:
+                    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=error,
+                                            cwd=worktree, env=env, start_new_session=True)
+                except OSError as launch_error:
+                    (turn / 'result.txt').write_text('')
+                    meta.update(status='failed', exit_code=1, finished_at=time.time(),
+                                failure_reason='native_launch_failed', launch_error=type(launch_error).__name__)
+                    save(directory / 'metadata.json', meta)
+                    raise
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+            def terminate(_signum, _frame):
+                raise KeyboardInterrupt()
+            signal.signal(signal.SIGTERM, terminate)
             try:
                 proc.communicate(task.encode(), timeout=timeout)
                 code = proc.returncode
@@ -404,6 +429,8 @@ def execute(args):
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
                 status, code = 'interrupted', 124
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
         meta['native_child_peak_rss_kib'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
         events = (turn / 'events.jsonl').read_text(errors='replace')
         reason = exhaustion_reason(events)

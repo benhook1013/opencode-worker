@@ -10,13 +10,22 @@ SOURCE = Path(__file__).resolve().parent
 MODULES = ('worker.py', 'live_worker.py', 'native_transport.py', 'cli_router.py', 'command_environment.js')
 
 
+def remove_tree(path):
+    def writable_retry(function, name, error):
+        os.chmod(Path(name).parent, 0o700)
+        if not Path(name).is_symlink():
+            os.chmod(name, 0o700)
+        function(name)
+    shutil.rmtree(path, onerror=writable_retry)
+
+
 def install(prefix):
     prefix = prefix.expanduser().resolve()
     runtime = (SOURCE / 'runtime').resolve()
     destination = prefix / 'share/api-worker'
     launcher = prefix / 'bin/api-worker'
-    if any(path.is_relative_to(runtime) for path in (prefix, destination.parent.resolve())):
-        raise ValueError('Choose a --prefix and share directory outside the source runtime')
+    if any(path.is_relative_to(runtime) for path in (prefix, destination.parent.resolve(), launcher.parent.resolve())):
+        raise ValueError('Choose a --prefix, share and bin directories outside the source runtime')
     if destination.exists() or destination.is_symlink() or launcher.exists() or launcher.is_symlink():
         raise ValueError('Refusing existing api-worker destination or launcher; choose a fresh --prefix')
     if not (runtime / 'node_modules/opencode-linux-x64/bin/opencode').is_file():
@@ -41,7 +50,8 @@ def install(prefix):
             target.write((SOURCE / 'bin/api-worker').read_text())
             target.flush()
             os.fchmod(target.fileno(), 0o700)
-    except Exception:
+    except Exception as original:
+        cleanup_errors = []
         if created_launcher is not None:
             try:
                 info = launcher.lstat()
@@ -49,11 +59,18 @@ def install(prefix):
                     launcher.unlink()
             except FileNotFoundError:
                 pass
-        if created_destination:
-            shutil.rmtree(destination)
+            except OSError as error:
+                cleanup_errors.append(str(error))
+        for path in ([destination] if created_destination else []) + [staging]:
+            try:
+                remove_tree(path)
+            except OSError as error:
+                cleanup_errors.append(str(error))
+        if cleanup_errors:
+            raise OSError(f'{original}; rollback also failed: ' + '; '.join(cleanup_errors)) from original
         raise
-    finally:
-        shutil.rmtree(staging)
+    else:
+        remove_tree(staging)
     return launcher
 
 

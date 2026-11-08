@@ -1,0 +1,201 @@
+"""Regression coverage for the latest hosted review, without live provider access."""
+import contextlib
+import http.client
+import json
+import os
+from pathlib import Path
+import tempfile
+import threading
+import time
+import unittest
+from unittest import mock
+import cli_router
+import install
+import live_worker as live
+import native_transport as transport
+import worker
+
+
+class ReviewRegressions(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.directory = self.root / ('a' * 32)
+        self.directory.mkdir(mode=0o700)
+        self.turn = self.directory / 'turn-one'
+        self.turn.mkdir()
+        live.atomic(self.directory / 'metadata.json', {'backend': 'native-server', 'session_id': 's',
+            'current_request_id': 'm', 'latest_turn': self.turn.name, 'worktree': str(self.root / 'project'),
+            'model': 'openai/gpt-6-luna', 'reasoning': 'high', 'server_lifecycle': 'running'})
+        (self.root / 'project').mkdir()
+
+    def test_option_first_resume_routes_to_managed(self):
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(cli_router.live, 'main', return_value=0) as route:
+            args = ['resume', '--task-file', 'task.txt', self.directory.name]
+            self.assertEqual(cli_router.main(args), 0)
+            route.assert_called_once_with(args)
+
+    def test_old_snapshot_cannot_replace_new_result(self):
+        done = {'request_id': 'm', 'status': 'complete', 'text': 'done', 'observed_at_ns': 20}
+        live.remember(self.directory, done)
+        live.remember(self.directory, {'request_id': 'm', 'status': 'running', 'text': '', 'observed_at_ns': 10})
+        self.assertEqual(live.read(self.directory)['current_result'], done)
+        self.assertEqual((self.turn / 'result.txt').read_text(), 'done')
+
+    def test_old_wait_cursor_is_superseded_before_observation(self):
+        with mock.patch.object(live, 'status') as status:
+            result = live.wait(self.directory, 'older')
+        self.assertEqual(result['status'], 'superseded')
+        status.assert_not_called()
+
+    def test_timeout_is_enforced_without_events(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        api = mock.Mock()
+        live.enforce_timeout(self.directory, api, 's')
+        api.abort.assert_called_once_with('s')
+
+    def test_orphan_backend_is_rejected(self):
+        api = mock.Mock()
+        api.request.return_value = {'healthy': True}
+        with mock.patch.object(live, 'client', return_value=api), self.assertRaisesRegex(ValueError, 'no live owner'):
+            live.ensure_server(self.directory)
+
+    def test_pending_receipt_without_metadata_blocks_distinct_task(self):
+        live.atomic(self.turn / 'receipt.json', {'stage_status': 'pending', 'submission_id': 'old'})
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'ensure_server'), mock.patch.object(live, 'client') as api:
+            with worker.credit_lock(): worker.credit_save(False, None)
+            with self.assertRaisesRegex(ValueError, 'staging receipt'):
+                live.send(self.directory, 'new task', 'new')
+            api.assert_not_called()
+
+    def test_active_request_blocks_distinct_task(self):
+        api = mock.Mock()
+        api.snapshot.return_value = {'status': 'running', 'native_status': 'busy'}
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'ensure_server'), mock.patch.object(live, 'client', return_value=api):
+            with worker.credit_lock(): worker.credit_save(False, None)
+            with self.assertRaisesRegex(ValueError, 'still active'):
+                live.send(self.directory, 'new task', 'new')
+            api.stage.assert_not_called()
+
+    def test_invalid_server_auth_is_rejected(self):
+        for value in ('', 'short', 'a' * 42, 'a' * 43 + '\n'):
+            (self.directory / 'server-auth').write_text(value)
+            with self.assertRaises(ValueError): live.server_password(self.directory)
+        (self.directory / 'server-auth').write_text('a' * 43)
+        self.assertEqual(live.server_password(self.directory), 'a' * 43)
+
+    def test_lock_wait_is_interruptible(self):
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(InterruptedError):
+            with live.locked(self.directory / 'control.lock', stopping=stop):
+                self.fail('entered after stop')
+
+    def test_incomplete_json_protocol_becomes_connection_error(self):
+        api = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/tmp')
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = http.client.IncompleteRead(b'')
+        with mock.patch.object(api, 'open', return_value=response):
+            with self.assertRaises(ConnectionError): api.request('GET', '/test')
+            with self.assertRaises(ConnectionError): api.messages_since('s', 'm')
+
+    def test_empty_stream_uses_snapshot_and_reconnects_until_deadline(self):
+        api = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/tmp')
+        with mock.patch.object(api, 'events', side_effect=lambda: (x for x in ())), mock.patch.object(api, 'snapshot', return_value={'status': 'running'}):
+            start = time.monotonic()
+            result = api.wait('s', 'm', timeout=0.05)
+            self.assertTrue(result['wait_timed_out'])
+            self.assertLess(time.monotonic() - start, 0.3)
+
+    def test_length_finish_is_provisional_while_busy(self):
+        api = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/tmp')
+        messages = [{'info': {'id': 'm', 'role': 'user'}, 'parts': []},
+                    {'info': {'id': 'n', 'role': 'assistant', 'parentID': 'm', 'finish': 'length', 'time': {'completed': 1}}, 'parts': []}]
+        with mock.patch.object(api, 'messages_since', return_value=messages), mock.patch.object(api, 'questions', return_value=[]), mock.patch.object(api, 'request', return_value={'s': {'type': 'busy'}}):
+            self.assertEqual(api.snapshot('s', 'm')['status'], 'running')
+
+    def test_persistently_idle_unfinished_assistant_needs_stable_grace(self):
+        api = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/tmp')
+        messages = [{'info': {'id': 'm', 'role': 'user'}, 'parts': []},
+                    {'info': {'id': 'n', 'role': 'assistant', 'parentID': 'm'}, 'parts': []}]
+        with mock.patch.object(api, 'messages_since', return_value=messages), mock.patch.object(api, 'questions', return_value=[]), mock.patch.object(api, 'request', return_value={}), mock.patch.object(transport.time, 'monotonic', return_value=0):
+            self.assertEqual(api.snapshot('s', 'm')['status'], 'queued')
+        with mock.patch.object(api, 'messages_since', return_value=messages), mock.patch.object(api, 'questions', return_value=[]), mock.patch.object(api, 'request', return_value={}), mock.patch.object(transport.time, 'monotonic', return_value=11):
+            self.assertEqual(api.snapshot('s', 'm')['incomplete_reason'], 'idle_unfinished_assistant')
+
+    def test_bin_symlink_to_runtime_is_rejected(self):
+        source = self.root / 'source'
+        (source / 'runtime').mkdir(parents=True)
+        prefix = self.root / 'prefix'
+        prefix.mkdir()
+        (prefix / 'bin').symlink_to(source / 'runtime')
+        with mock.patch.object(install, 'SOURCE', source), self.assertRaisesRegex(ValueError, 'outside the source runtime'):
+            install.install(prefix)
+        self.assertEqual(list((source / 'runtime').iterdir()), [])
+
+    def test_atomic_save_preserves_existing_file_on_write_failure(self):
+        path = self.root / 'state.json'
+        worker.save(path, {'old': True})
+        with mock.patch.object(worker.os, 'fsync', side_effect=OSError('fixture')), self.assertRaises(OSError):
+            worker.save(path, {'new': True})
+        self.assertEqual(json.loads(path.read_text()), {'old': True})
+        self.assertEqual(list(self.root.glob('.receipt-*')), [])
+
+    def batch_args(self):
+        import argparse
+        task = self.root / 'task.txt'
+        task.write_text('fixture')
+        key = self.root / 'key'
+        key.write_text('fixture')
+        key.chmod(0o600)
+        args = argparse.Namespace(action='run', model='openai/gpt-6-luna', reasoning='high',
+            worktree=str(self.root / 'project'), task_file=str(task), allow_write=False,
+            max_steps=None, max_output_tokens=None, timeout=None)
+        return args, key
+
+    def test_batch_launch_failure_finishes_receipt(self):
+        args, key = self.batch_args()
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(worker, 'KEY', key), mock.patch.object(worker.subprocess, 'Popen', side_effect=OSError('fixture')):
+            with worker.credit_lock(): worker.credit_save(False, None)
+            with self.assertRaises(OSError): worker.execute(args)
+        records = [json.loads(p.read_text()) for p in self.root.glob('*/metadata.json')]
+        failed = next(record for record in records if record.get('failure_reason') == 'native_launch_failed')
+        self.assertEqual(failed['status'], 'failed')
+        self.assertTrue((self.root / failed['run_id'] / failed['latest_turn'] / 'result.txt').exists())
+
+    def test_batch_sigterm_stops_child_and_records_interruption(self):
+        import signal
+        args, key = self.batch_args()
+        process = mock.Mock(pid=999999, returncode=-15)
+        process.communicate.side_effect = lambda *a, **k: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(worker, 'KEY', key), mock.patch.object(worker.subprocess, 'Popen', return_value=process), mock.patch.object(worker.os, 'killpg') as kill, contextlib.redirect_stdout(__import__('io').StringIO()):
+            with worker.credit_lock(): worker.credit_save(False, None)
+            self.assertEqual(worker.execute(args), 124)
+            kill.assert_called_once_with(process.pid, signal.SIGTERM)
+            process.wait.assert_called_once()
+
+    def test_shutdown_publishes_intent_before_abort(self):
+        api = mock.Mock()
+        api.abort.side_effect = lambda session: self.assertTrue(live.read(self.directory)['stop_requested'])
+        api.request.return_value = {}
+        def stopped(*args):
+            live.update(self.directory, server_lifecycle='stopped')
+            return True
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'client', return_value=api), mock.patch.object(live, 'signal_owned', side_effect=stopped), contextlib.redirect_stdout(__import__('io').StringIO()):
+            self.assertEqual(live.main(['shutdown', self.directory.name]), 0)
+            api.abort.assert_called_once_with('s')
+
+    def test_rollback_preserves_both_original_and_cleanup_errors(self):
+        # The install's explicit cleanup diagnostic must retain the initiating failure.
+        source = self.root / 'source'
+        runtime = source / 'runtime'
+        binary = runtime / 'node_modules/opencode-linux-x64/bin/opencode'
+        binary.parent.mkdir(parents=True)
+        binary.write_text('fixture')
+        for name in (*install.MODULES, 'README.md', 'LICENSE'):
+            (source / name).write_text('fixture')
+        with mock.patch.object(install, 'SOURCE', source), mock.patch.object(install.shutil, 'copyfile', side_effect=OSError('original')), mock.patch.object(install, 'remove_tree', side_effect=OSError('cleanup')):
+            with self.assertRaisesRegex(OSError, 'original; rollback also failed: cleanup'):
+                install.install(self.root / 'prefix')

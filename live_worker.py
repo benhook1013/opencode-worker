@@ -28,30 +28,23 @@ class RequestAdvanced(Exception):
     pass
 
 
-def atomic(path, value):
-    """Durably replace a receipt by syncing its temporary file and containing directory."""
-    fd, filename = tempfile.mkstemp(prefix='.receipt-', dir=path.parent)
-    try:
-        with os.fdopen(fd, 'w') as handle:
-            json.dump(value, handle, indent=2)
-            handle.write('\n')
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(filename, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if os.path.exists(filename):
-            os.unlink(filename)
+atomic = batch.save
 
 
 @contextmanager
-def locked(path, blocking=True):
+def locked(path, blocking=True, stopping=None):
     with path.open('a') as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        if stopping is None:
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        else:
+            while not stopping.is_set():
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    stopping.wait(0.05)
+            else:
+                raise InterruptedError('Shutdown interrupted lock wait')
         yield
 
 
@@ -99,6 +92,26 @@ def signal_owned(meta, kind, signum):
             os.close(descriptor)
 
 
+def server_password(directory):
+    password = (directory / 'server-auth').read_text()
+    if not re.fullmatch(r'[A-Za-z0-9_-]{43}', password):
+        raise ValueError('Invalid server authentication file; backend was not launched')
+    return password
+
+
+def owner_alive(meta):
+    pid, ticks = meta.get('owner_pid'), meta.get('owner_start_ticks')
+    return bool(pid and ticks and process_identity(pid) == ticks)
+
+
+def enforce_timeout(directory, api, session):
+    meta = read(directory)
+    if (meta.get('timeout_seconds') and meta.get('current_request_id')
+            and (meta.get('current_result') or {}).get('status') not in TERMINAL
+            and time.time() - meta.get('submitted_at', time.time()) >= meta['timeout_seconds']):
+        api.abort(session)
+
+
 def client(directory):
     meta = read(directory)
     password = (directory / 'server-auth').read_text()
@@ -143,6 +156,10 @@ def remember(directory, result):
     with locked(directory / 'metadata.lock'):
         meta = read(directory)
         if not result.get('request_id') or result['request_id'] != meta.get('current_request_id'):
+            return
+        prior = meta.get('current_result') or {}
+        if (prior.get('status') in TERMINAL and result.get('status') not in TERMINAL
+                or prior.get('observed_at_ns', 0) > result.get('observed_at_ns', 0)):
             return
         if result.get('execution_observed'):
             confirm_dispatch(directory, meta, result['request_id'], 'native_execution')
@@ -198,7 +215,7 @@ def run_server(directory):
         settings = json.loads((directory / 'settings.json').read_text())
         env = batch.environment(directory, settings, meta.get('output_override'))
         env.update(meta.get('command_environment', {}))
-        env['OPENCODE_SERVER_PASSWORD'] = (directory / 'server-auth').read_text()
+        env['OPENCODE_SERVER_PASSWORD'] = server_password(directory)
         env['OPENCODE_ENABLE_QUESTION_TOOL'] = 'true'
         if meta.get('allow_commands'):
             env['OPENCODE_PURE'] = 'false'  # Only the controlled shell.env hook in isolated config.
@@ -239,7 +256,7 @@ def run_server(directory):
                 last_snapshot = float('-inf')
                 while process.poll() is None and not stopping.is_set():
                     try:
-                        for event in api.events():
+                        for event in api.events(timeout=1):
                             observe(directory, event, record=True)
                             meta = read(directory)
                             if meta.get('observer_state') != 'connected':
@@ -260,7 +277,7 @@ def run_server(directory):
                             if meta.get('timeout_seconds') and not terminal and time.time() - meta.get('submitted_at', time.time()) >= meta['timeout_seconds']:
                                 api.abort(session)
                             if idle_since is not None and time.monotonic() - idle_since >= (meta.get('idle_reap_seconds', 30) if message else 30):
-                                with locked(directory / 'control.lock'):
+                                with locked(directory / 'control.lock', stopping=stopping):
                                     latest = read(directory)
                                     if latest.get('current_request_id') == message and (not message or api.snapshot(session, message)['status'] in TERMINAL):
                                         update(directory, stop_requested=True)
@@ -274,6 +291,7 @@ def run_server(directory):
                         update(directory, observer_state='degraded')
                         # Reconcile retained native state after transport loss; never replay a prompt.
                         try:
+                            enforce_timeout(directory, api, session)
                             latest = read(directory)
                             if latest.get('current_request_id'):
                                 configure_dispatch(directory, api, latest)
@@ -301,6 +319,8 @@ def ensure_server(directory):
     if meta.get('server_lifecycle') == 'running':
         try:
             if client(directory).request('GET', '/global/health').get('healthy'):
+                if not owner_alive(meta):
+                    raise ValueError('Native backend has no live owner; inspect or shut it down before submitting')
                 return
         except OSError:
             pass
@@ -309,6 +329,8 @@ def ensure_server(directory):
         if meta.get('server_lifecycle') == 'running':
             try:
                 if client(directory).request('GET', '/global/health').get('healthy'):
+                    if not owner_alive(meta):
+                        raise ValueError('Native backend has no live owner; inspect or shut it down before submitting')
                     return
             except OSError:
                 pass
@@ -317,6 +339,7 @@ def ensure_server(directory):
                 pass
         except BlockingIOError:
             raise ValueError('Native owner is still active but unresponsive; no backend was replaced or task replayed') from None
+        server_password(directory)
         update(directory, server_lifecycle='starting', server_error=None)
         with (directory / 'owner.log').open('ab') as log:
             subprocess.Popen([sys.executable, '-I', str(ROOT / 'live_worker.py'), '_serve', str(directory)],
@@ -379,8 +402,15 @@ def send(directory, task, submission_id=None):
             raise ValueError('Uncertain native submission blocks new tasks; inspect retained state. Nothing was redispatched.')
         if meta.get('stop_requested'):
             raise ValueError('Native backend is stopping; no task was staged. Retry explicitly after shutdown completes')
+        if any(json.loads(path.read_text()).get('stage_status') == 'pending'
+               for path in directory.glob('turn-*/receipt.json')):
+            raise ValueError('Uncertain native staging receipt blocks new submissions; inspect retained state')
         batch.validate_worktree(meta['worktree'])
         api = client(directory)
+        if meta.get('current_request_id'):
+            current = api.snapshot(meta['session_id'], meta['current_request_id'])
+            if current['status'] not in TERMINAL or current.get('native_status') != 'idle':
+                raise ValueError('Prior request is still active; wait or cancel before a distinct submission')
         turn = directory / ('turn-' + uuid.uuid4().hex)
         batch.private_dir(turn)
         (turn / 'task.txt').write_text(task)
@@ -429,6 +459,7 @@ def status(directory):
         try:
             result = client(directory).snapshot(meta['session_id'], meta.get('current_request_id'))
             remember(directory, result)
+            result = read(directory).get('current_result') or result
         except OSError:
             result = read(directory).get('current_result')
             if not result or result['status'] not in TERMINAL:
@@ -471,9 +502,11 @@ def wait_result(directory, result, request_id):
         return {**result, 'run_id': directory.name, 'pricing_warning': meta.get('pricing_warning')}
 
 
-def wait(directory):
+def wait(directory, request_id=None):
     with locked(directory / 'control.lock'):
         meta = read(directory)
+    if request_id is not None and meta.get('current_request_id') != request_id:
+        return wait_result(directory, {}, request_id)
     current = status(directory)
     if current['status'] in TERMINAL or current['status'] == 'needs_input':
         return wait_result(directory, current, meta.get('current_request_id'))
@@ -520,8 +553,7 @@ def start(args):
         previous = read(directory)
         if not previous.get('current_request_id'):
             return send(directory, task, args.submission_id)
-        return {'run_id': directory.name, 'session_id': previous.get('session_id'),
-                'request_id': previous.get('current_request_id'), 'status': previous.get('status', 'starting'), 'already_submitted': True}
+        return send(directory, task, args.submission_id)
     batch.private_dir(directory)
     # Older wait commands could leave a control lock before initialization.
     for entry in directory.iterdir():
@@ -542,7 +574,11 @@ def start(args):
                 command_env[name] = os.environ[name]
         command_env.setdefault('GRADLE_USER_HOME', str(Path.home() / '.gradle'))
     atomic(directory / 'settings.json', settings)
-    (directory / 'server-auth').write_text(secrets.token_urlsafe(32))
+    with (directory / 'server-auth').open('w') as password_file:
+        os.fchmod(password_file.fileno(), 0o600)
+        password_file.write(secrets.token_urlsafe(32))
+        password_file.flush()
+        os.fsync(password_file.fileno())
     atomic(directory / 'metadata.json', {'backend': 'native-server', 'start_spec_sha256': spec, 'status': 'starting', 'run_id': directory.name, 'worktree': worktree,
         'model': model, 'reasoning': args.reasoning, 'model_limits': limits, 'model_limits_explicit': bool(args.context_window or args.model_output_limit),
         'allow_write': args.allow_write, 'allow_commands': args.allow_commands, 'long_context': args.long_context,
@@ -668,24 +704,33 @@ def main(argv=None):
             reply(directory, args.question_id, json.loads(Path(args.answers_file).read_text()))
             result = {'run_id': directory.name, 'status': 'answer_submitted'}
         else:
-            meta = read(directory)
-            if meta.get('server_lifecycle') == 'running':
-                client(directory).abort(meta['session_id'])  # Native cancellation first; existing edits persist.
-                if args.action == 'shutdown' and meta.get('owner_pid'):
-                    if not signal_owned(meta, 'owner', signal.SIGTERM):
-                        signal_owned(meta, 'native_server', signal.SIGTERM)
-                    deadline = time.monotonic() + 10
-                    while read(directory).get('server_lifecycle') != 'stopped' and time.monotonic() < deadline:
-                        if process_identity(meta.get('native_server_pid')) != meta.get('native_server_start_ticks'):
-                            update(directory, server_lifecycle='stopped', owner_pid=None, native_server_pid=None)
-                            break
-                        time.sleep(0.05)
-                    if read(directory).get('server_lifecycle') != 'stopped':
-                        raise ValueError('Backend shutdown not confirmed; inspect private lifecycle state')
+            # Serialize cancellation and shutdown, including native cleanup, against send.
+            with locked(directory / 'control.lock'):
+                meta = read(directory)
+                if args.action == 'shutdown':
+                    update(directory, stop_requested=True)
+                if meta.get('server_lifecycle') == 'running':
+                    api = client(directory)
+                    api.abort(meta['session_id'])
+                    if args.action == 'shutdown':
+                        deadline = time.monotonic() + 10
+                        while api.request('GET', '/session/status').get(meta['session_id'], {'type': 'idle'})['type'] != 'idle':
+                            if time.monotonic() >= deadline:
+                                raise ValueError('Native cancellation cleanup not confirmed; backend retained for inspection')
+                            time.sleep(0.05)
+                        if not signal_owned(meta, 'owner', signal.SIGTERM):
+                            signal_owned(meta, 'native_server', signal.SIGTERM)
+                        while read(directory).get('server_lifecycle') != 'stopped' and time.monotonic() < deadline:
+                            if process_identity(meta.get('native_server_pid')) != meta.get('native_server_start_ticks'):
+                                update(directory, server_lifecycle='stopped', owner_pid=None, native_server_pid=None)
+                                break
+                            time.sleep(0.05)
+                        if read(directory).get('server_lifecycle') != 'stopped':
+                            raise ValueError('Backend shutdown not confirmed; inspect private lifecycle state')
             result = {'run_id': directory.name, 'status': 'cancel_requested' if args.action == 'cancel' else 'stopped'}
     if args.action == 'start' and args.wait:
         print(json.dumps(result), flush=True)
-        result = wait(batch.STATE / result['run_id'])
+        result = wait(batch.STATE / result['run_id'], result.get('request_id'))
     print(json.dumps(result))
     if args.action == 'wait' or (args.action == 'start' and args.wait):
         return {'complete': 0, 'incomplete': 2, 'needs_input': 3, 'superseded': 4, 'interrupted': 124}.get(result['status'], 1)

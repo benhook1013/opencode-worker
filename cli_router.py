@@ -24,11 +24,19 @@ def main(argv=None):
         if '--wait' not in arguments:
             arguments.append('--wait')
         return live.main(['start', *arguments])
-    if command in ('resume', 'status', 'result') and len(argv) > 1 and not argv[1].startswith('-'):
-        identifier = batch.run_id(argv[1])
-        path = batch.STATE / identifier / 'metadata.json'
-        if path.is_file() and json.loads(path.read_text()).get('backend') == 'native-server':
-            return live.main(argv)
+    if command in ('resume', 'status', 'result'):
+        routing = argparse.ArgumentParser(add_help=False)
+        routing.add_argument('run_id', nargs='?')
+        for option in ('task-file', 'submission-id', 'max-output-tokens', 'max-steps',
+                       'context-window', 'model-output-limit', 'timeout'):
+            routing.add_argument('--' + option)
+        routing.add_argument('--long-context', action=argparse.BooleanOptionalAction)
+        parsed, _ = routing.parse_known_args(argv[1:])
+        if parsed.run_id:
+            identifier = batch.run_id(parsed.run_id)
+            path = batch.STATE / identifier / 'metadata.json'
+            if path.is_file() and json.loads(path.read_text()).get('backend') == 'native-server':
+                return live.main(argv)
     previous = sys.argv
     try:
         sys.argv = ['api-worker', *argv]

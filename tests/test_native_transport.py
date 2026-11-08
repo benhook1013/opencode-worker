@@ -384,7 +384,7 @@ class NativeServerTests(unittest.TestCase):
         directory = self.root / ('d' * 32)
         directory.mkdir(mode=0o700)
         live.atomic(directory / 'settings.json', self.settings)
-        (directory / 'server-auth').write_text('fixture-only-server-auth')
+        (directory / 'server-auth').write_text('f' * 43)
         live.atomic(directory / 'metadata.json', {'backend': 'native-server', 'run_id': directory.name,
             'worktree': str(self.project), 'model': 'openai/gpt-6-luna', 'reasoning': 'high',
             'server_lifecycle': 'new', 'idle_reap_seconds': 0.1})
@@ -443,7 +443,7 @@ class NativeServerTests(unittest.TestCase):
         settings = transport.live_settings(self.settings, allow_commands=True,
             shell_plugin=(ROOT / 'command_environment.js').as_uri())
         live.atomic(directory / 'settings.json', settings)
-        (directory / 'server-auth').write_text('fixture-only-server-auth')
+        (directory / 'server-auth').write_text('f' * 43)
         (directory / 'server-auth').chmod(0o600)
         live.atomic(directory / 'metadata.json', {'backend': 'native-server', 'run_id': directory.name,
             'worktree': str(self.project), 'model': 'openai/gpt-6-luna', 'reasoning': 'high',
@@ -453,8 +453,8 @@ class NativeServerTests(unittest.TestCase):
             def target():
                 original_events, original_snapshot = live.NativeClient.events, live.NativeClient.snapshot
                 faults = {'injected': False, 'second': False}
-                def flaky_events(api):
-                    for event in original_events(api):
+                def flaky_events(api, **kwargs):
+                    for event in original_events(api, **kwargs):
                         if event.get('type') == 'session.status' and event.get('properties', {}).get('status', {}).get('type') == 'busy' and not faults['injected']:
                             faults['injected'] = True
                             (directory / 'observer-fault-injected').write_text('fixture')
@@ -474,7 +474,7 @@ class NativeServerTests(unittest.TestCase):
             while time.monotonic() < deadline:
                 if live.read(directory).get('server_lifecycle') == 'running': return process
                 time.sleep(0.05)
-            self.fail('Managed fixture did not start')
+            self.fail('Managed fixture did not start: ' + str(live.read(directory)) + '\n' + (directory / 'native-server.log').read_text()[-2500:])
         owner = launch_owner()
         state = self.root / 'credit-guard.json'
         with mock.patch.object(live.batch, 'STATE', self.root):
@@ -677,7 +677,7 @@ class EventReconciliationTests(unittest.TestCase):
             live.atomic(directory / 'metadata.json', {'session_id': 'fixture-session',
                 'worktree': str(project), 'current_request_id': 'fixture-request'})
             live.atomic(directory / 'settings.json', {})
-            (directory / 'server-auth').write_text('fixture-only')
+            (directory / 'server-auth').write_text('f' * 43)
             process = mock.Mock(pid=12345)
             process.poll.return_value = None
             api = mock.Mock()
@@ -693,7 +693,7 @@ class EventReconciliationTests(unittest.TestCase):
                     log.write('opencode server listening on http://127.0.0.1:1\n')
                 return process
 
-            def events():
+            def events(**kwargs):
                 """Stop the fake process after a burst and outcome-changing events are consumed."""
                 yield {'type': 'server.connected'}
                 for _ in range(1000):
@@ -804,7 +804,7 @@ class LiveBoundaryTests(unittest.TestCase):
         """Persist a matching startup failure while keeping uncertain dispatches blocked and inspectable."""
         turn = self.directory / 'turn-fixture'
         turn.mkdir()
-        (self.directory / 'server-auth').write_text('fixture-only')
+        (self.directory / 'server-auth').write_text('f' * 43)
         error = {'name': 'UnknownError', 'data': {'message': 'Fixture startup failure'}}
         for acknowledged, with_error in ((True, False), (True, True), (False, True)):
             with self.subTest(acknowledged=acknowledged, with_error=with_error):
@@ -984,7 +984,7 @@ class LiveBoundaryTests(unittest.TestCase):
             directory = self.root / args.worker_id
             live.update(directory, current_request_id='native-accepted')
             live.start(args)
-            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_count, 2)
             args.worktree = str(second)
             with self.assertRaisesRegex(ValueError, 'different initial assignment'): live.start(args)
             args.worktree = str(first)
@@ -1029,7 +1029,7 @@ class LiveBoundaryTests(unittest.TestCase):
                     self.assertEqual(start.call_args.args[0].reasoning, 'high')
                     self.assertTrue(start.call_args.args[0].wait)
                     self.assertEqual(start.call_args.args[0].allow_commands, route == '--allow-commands')
-                    wait.assert_called_once_with(self.directory)
+                    wait.assert_called_once_with(self.directory, None)
                     self.assertEqual(len(output.getvalue().splitlines()), 2)
 
     def test_invalid_reasoning_is_rejected_before_worker_setup(self):
