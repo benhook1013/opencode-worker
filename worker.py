@@ -52,6 +52,14 @@ def sync_directory(path):
         os.close(descriptor)
 
 
+def durable_text(path, text):
+    with path.open('w') as receipt:
+        receipt.write(text)
+        receipt.flush()
+        os.fsync(receipt.fileno())
+    sync_directory(path.parent)
+
+
 def private_dir(path):
     missing = []
     parent = path
@@ -494,6 +502,9 @@ def execute(args):
         meta.pop('incomplete_reason', None)
         meta.pop('recovered_context_overflow', None)
         meta.pop('credit_latch_error', None)
+        meta.pop('failure_reason', None)
+        meta.pop('launch_error', None)
+        meta.pop('credit_exhaustion_reason', None)
         task = Path(args.task_file).read_text()
         if not task.strip():
             raise ValueError('Task file is empty')
@@ -533,7 +544,7 @@ def execute(args):
                             proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=error,
                                                     cwd=worktree, env=env, start_new_session=True)
                         except OSError as launch_error:
-                            (turn / 'result.txt').write_text('')
+                            durable_text(turn / 'result.txt', '')
                             meta.update(status='failed', exit_code=1, finished_at=time.time(),
                                         failure_reason='native_launch_failed', launch_error=type(launch_error).__name__)
                             save(directory / 'metadata.json', meta)
@@ -591,7 +602,7 @@ def execute(args):
                     print(f'api-worker: incomplete turn ({incomplete}); inspect partial output and possible edits before explicit resume.', file=sys.stderr)
             if session_id:
                 meta['session_id'] = session_id
-            (turn / 'result.txt').write_text(result)
+            durable_text(turn / 'result.txt', result)
             meta.update(status=status, exit_code=code, finished_at=time.time())
             save(directory / 'metadata.json', meta)
             print(json.dumps({**meta, 'artifacts': str(turn)}))

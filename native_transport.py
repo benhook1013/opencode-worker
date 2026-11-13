@@ -322,9 +322,15 @@ class NativeClient:
                 except (ConnectionError, socket.timeout, urllib.error.URLError):
                     if self.deadline is not None and time.monotonic() >= self.deadline:
                         return {**result, 'wait_timed_out': True}
-                    result = self.snapshot(session_id, message_id)
-                    if result['status'] in terminal:
-                        return result
+                    try:
+                        result = self.snapshot(session_id, message_id)
+                    except (ConnectionError, socket.timeout, urllib.error.URLError):
+                        pass  # Preserve the last observation and retry within the deadline.
+                    else:
+                        if observer:
+                            observer(result)
+                        if result['status'] in terminal:
+                            return result
                     remaining = self.deadline - time.monotonic() if self.deadline else 0.2
                     time.sleep(max(0, min(0.2, remaining)))
                 finally:

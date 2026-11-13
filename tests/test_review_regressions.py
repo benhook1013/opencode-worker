@@ -30,6 +30,41 @@ class ReviewRegressions(unittest.TestCase):
             'model': 'openai/gpt-6-luna', 'reasoning': 'high', 'server_lifecycle': 'running'})
         (self.root / 'project').mkdir()
 
+    def test_wait_reobserves_newer_nonterminal_result_on_same_cursor(self):
+        with mock.patch.object(live, 'wait_once', side_effect=[{'status': 'running'}, {'status': 'complete'}]) as observe:
+            self.assertEqual(live.wait(self.directory)['status'], 'complete')
+            self.assertEqual(observe.call_args_list, [mock.call(self.directory, 'm')] * 2)
+
+    def test_reconnect_snapshot_failure_retries_until_terminal(self):
+        api = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/tmp')
+        with mock.patch.object(api, 'events', side_effect=lambda: (x for x in ())), mock.patch.object(api, 'snapshot', side_effect=[ConnectionError('offline'), {'status': 'complete'}]), mock.patch.object(transport.time, 'sleep'):
+            self.assertEqual(api.wait('s', 'm', timeout=1)['status'], 'complete')
+
+    def test_reconnect_snapshot_failure_preserves_deadline(self):
+        api = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/tmp')
+        with mock.patch.object(api, 'events', side_effect=lambda: (x for x in ())), mock.patch.object(api, 'snapshot', side_effect=ConnectionError('offline')):
+            self.assertTrue(api.wait('s', 'm', timeout=0.01)['wait_timed_out'])
+
+    def test_durable_text_syncs_file_before_parent(self):
+        events = []
+        with mock.patch.object(worker.os, 'fsync', side_effect=lambda fd: events.append('file')), mock.patch.object(worker, 'sync_directory', side_effect=lambda path: events.append(path)):
+            worker.durable_text(self.turn / 'result.txt', 'done')
+        self.assertEqual(events, ['file', self.turn])
+        self.assertEqual((self.turn / 'result.txt').read_text(), 'done')
+
+    def test_resume_clears_old_failure_diagnostics_before_launch(self):
+        args, key = self.batch_args()
+        args.action, args.run_id = 'resume', self.directory.name
+        live.update(self.directory, allow_write=False, failure_reason='old', launch_error='old', credit_exhaustion_reason='old')
+        def launch(*a, **k):
+            record = live.read(self.directory)
+            for field in ('failure_reason', 'launch_error', 'credit_exhaustion_reason'):
+                self.assertNotIn(field, record)
+            raise OSError('fixture')
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(worker, 'KEY', key), mock.patch.object(worker.subprocess, 'Popen', side_effect=launch):
+            with worker.credit_lock(): worker.credit_save(False, None)
+            with self.assertRaises(OSError): worker.execute(args)
+
     def test_option_first_resume_routes_to_managed(self):
         with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(cli_router.live, 'main', return_value=0) as route:
             args = ['resume', '--task-file', 'task.txt', self.directory.name]

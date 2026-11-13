@@ -637,6 +637,18 @@ def wait_result(directory, result, request_id):
 
 
 def wait(directory, request_id=None):
+    # A newer retained observation can invalidate a provisional terminal result.
+    # Keep the original cursor while observing again rather than returning running.
+    if request_id is None:
+        with locked(directory / 'control.lock'):
+            request_id = read(directory).get('current_request_id')
+    while True:
+        result = wait_once(directory, request_id)
+        if result['status'] in TERMINAL or result['status'] in {'needs_input', 'superseded'}:
+            return result
+
+
+def wait_once(directory, request_id=None):
     with locked(directory / 'control.lock'):
         meta = read(directory)
     if request_id is not None and meta.get('current_request_id') != request_id:
