@@ -352,6 +352,28 @@ class CreditGuardTests(unittest.TestCase):
                 self.assertEqual(saved['status'], 'interrupted')
                 self.assertEqual(worker.signal.getsignal(worker.signal.SIGTERM), previous)
 
+    def test_missing_child_group_during_cleanup_still_finalizes(self):
+        previous = worker.signal.getsignal(worker.signal.SIGTERM)
+        for missing in (worker.signal.SIGTERM, worker.signal.SIGKILL):
+            with self.subTest(missing=missing):
+                process = mock.Mock(pid=12345, returncode=0)
+                process.communicate.side_effect = worker.subprocess.TimeoutExpired('fixture', 1)
+                process.wait.side_effect = ([0] if missing == worker.signal.SIGTERM else
+                    [worker.subprocess.TimeoutExpired('fixture', 3), 0])
+                def killpg(pid, signum):
+                    if signum == missing:
+                        raise ProcessLookupError('child group already exited')
+                with mock.patch.object(worker.subprocess, 'Popen', return_value=process), \
+                        mock.patch.object(worker.os, 'killpg', side_effect=killpg):
+                    code, meta = self.native_fixture('')
+                self.assertEqual((code, meta['status']), (124, 'interrupted'))
+                self.assertEqual(process.wait.call_count, 1 if missing == worker.signal.SIGTERM else 2)
+                artifact = Path(meta['artifacts'])
+                saved = json.loads((artifact.parent / 'metadata.json').read_text())
+                self.assertEqual(saved['status'], 'interrupted')
+                self.assertTrue(artifact.joinpath('result.txt').exists())
+                self.assertEqual(worker.signal.getsignal(worker.signal.SIGTERM), previous)
+
     def test_native_defaults_compaction_and_request_timeouts(self):
         settings = worker.config('openai/gpt-6-luna', 'high', False)
         self.assertNotIn('steps', settings['agent']['worker'])

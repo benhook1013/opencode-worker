@@ -37,11 +37,47 @@ class ReviewRegressions(unittest.TestCase):
             route.assert_called_once_with(args)
 
     def test_old_snapshot_cannot_replace_new_result(self):
-        done = {'request_id': 'm', 'status': 'complete', 'text': 'done', 'observed_at_ns': 20}
+        done = {'request_id': 'm', 'status': 'complete', 'text': 'done', 'observed_at_ns': 20, 'observed_boot_id': 'boot-one'}
         live.remember(self.directory, done)
-        live.remember(self.directory, {'request_id': 'm', 'status': 'running', 'text': '', 'observed_at_ns': 10})
+        live.remember(self.directory, {'request_id': 'm', 'status': 'running', 'text': '', 'observed_at_ns': 10, 'observed_boot_id': 'boot-one'})
         self.assertEqual(live.read(self.directory)['current_result'], done)
         self.assertEqual((self.turn / 'result.txt').read_text(), 'done')
+
+    def test_new_boot_observation_replaces_old_monotonic_time(self):
+        live.remember(self.directory, {'request_id': 'm', 'status': 'running', 'text': 'old',
+            'observed_at_ns': 9999, 'observed_boot_id': 'previous-boot'})
+        live.remember(self.directory, {'request_id': 'm', 'status': 'complete', 'text': 'new',
+            'observed_at_ns': 1, 'observed_boot_id': 'current-boot'})
+        self.assertEqual((self.turn / 'result.txt').read_text(), 'new')
+
+    def test_status_does_not_relabel_stale_snapshot_as_pending_request(self):
+        api = mock.Mock()
+        def snapshot(*args):
+            live.update(self.directory, current_request_id='new', current_result=None, pending_dispatch='turn-new')
+            return {'request_id': 'm', 'status': 'running', 'text': 'old output', 'execution_observed': True}
+        api.snapshot.side_effect = snapshot
+        with mock.patch.object(live, 'client', return_value=api):
+            result = live.status(self.directory)
+        self.assertEqual(result['request_id'], 'new')
+        self.assertEqual(result['text'], '')
+        self.assertNotIn('execution_observed', result)
+        self.assertEqual(result['failure_reason'], 'dispatch_unconfirmed')
+
+    def test_submission_lock_covers_controls_and_admission(self):
+        acquired = []
+        @contextlib.contextmanager
+        def lock(path, **kwargs):
+            acquired.append(path.name)
+            try: yield
+            finally: acquired.pop()
+        def controls(*args):
+            self.assertEqual(acquired, ['submission.lock'])
+        def admission(*args):
+            self.assertEqual(acquired, ['submission.lock'])
+            return 'accepted'
+        with mock.patch.object(live, 'locked', side_effect=lock), mock.patch.object(live, 'configure_idle', side_effect=controls), mock.patch.object(live, '_send', side_effect=admission):
+            self.assertEqual(live.send(self.directory, 'task', 'key', controls=object()), 'accepted')
+            self.assertEqual(live.send(self.directory, 'task', 'key'), 'accepted')
 
     def test_old_wait_cursor_is_superseded_before_observation(self):
         with mock.patch.object(live, 'status') as status:

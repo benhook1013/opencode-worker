@@ -447,11 +447,17 @@ def execute(args):
                     status = 'complete' if code == 0 else 'failed'
                 except (subprocess.TimeoutExpired, KeyboardInterrupt):
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass  # The child group already exited; still reap and finalize.
                     try:
                         proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        os.killpg(proc.pid, signal.SIGKILL)
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass  # Exit can race with escalation.
                         proc.wait()
                     status, code = 'interrupted', 124
             meta['native_child_peak_rss_kib'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss

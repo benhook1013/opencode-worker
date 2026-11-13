@@ -2,6 +2,7 @@
 import base64
 import http.client
 import json
+from pathlib import Path
 import socket
 import time
 import urllib.error
@@ -9,6 +10,15 @@ import urllib.parse
 import urllib.request
 
 DISPATCH_GRACE_SECONDS = 10
+REQUEST_MARKER = 'opencode_worker_request_id'
+
+
+def boot_id():
+    """Identify the monotonic clock epoch; unavailable identity must never imply comparability."""
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip() or None
+    except (OSError, UnicodeError):
+        return None
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -30,6 +40,7 @@ def request_assistants(messages, message_id):
     if start is None:
         return []  # No ancestry proof: never borrow an arbitrary later assistant answer.
     parents, compactions, completed_compactions = {message_id}, set(), set()
+    overflow_compactions = set()
     last_user = message_id
     candidates = []
     for message in ordered[start + 1:]:
@@ -40,7 +51,15 @@ def request_assistants(messages, message_id):
                 and (part.get('metadata') or {}).get('compaction_continue') is True for part in parts)
             if automatic and last_user in parents | compactions:
                 compactions.add(info['id'])
+                if any(part.get('type') == 'compaction' and part.get('auto') is True
+                       and part.get('overflow') is True for part in parts):
+                    overflow_compactions.add(info['id'])
             elif continuation and last_user in completed_compactions:
+                parents.add(info['id'])
+            elif (last_user in completed_compactions & overflow_compactions
+                  and any(part.get('type') == 'text'
+                          and (part.get('metadata') or {}).get(REQUEST_MARKER) == message_id for part in parts)):
+                # Pinned native overflow replay copies original part metadata, not IDs.
                 parents.add(info['id'])
             else:
                 break  # A manual follow-up is a distinct request, even if its text is identical.
@@ -117,7 +136,8 @@ class NativeClient:
                    'variant': reasoning, 'parts': [{'type': 'text', 'text': task}]}
         # Obtain the native ID without generating an ID or starting provider work.
         receipt = self.request('POST', f'/session/{session_id}/message', {**payload, 'noReply': True})
-        payload['parts'] = [{'id': p['id'], 'type': 'text', 'text': p['text']}
+        payload['parts'] = [{'id': p['id'], 'type': 'text', 'text': p['text'],
+                             'metadata': {**(p.get('metadata') or {}), REQUEST_MARKER: receipt['info']['id']}}
                             for p in receipt['parts'] if p.get('type') == 'text']
         return receipt['info']['id'], payload
 
@@ -169,7 +189,7 @@ class NativeClient:
             native = self.request('GET', '/session/status').get(session_id, {'type': 'idle'})['type']
         candidates = request_assistants(messages, message_id)
         result = {'session_id': session_id, 'request_id': message_id, 'status': 'running' if native != 'idle' else 'queued',
-                  'native_status': native, 'text': '', 'questions': questions, 'observed_at_ns': observed_at_ns,
+                  'native_status': native, 'text': '', 'questions': questions, 'observed_at_ns': observed_at_ns, 'observed_boot_id': boot_id(),
                   'execution_observed': any(not item['info'].get('summary') for item in candidates)}
         if questions:
             result['status'] = 'needs_input'

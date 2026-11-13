@@ -161,7 +161,8 @@ def remember(directory, result):
             return
         prior = meta.get('current_result') or {}
         if (prior.get('status') in TERMINAL and result.get('status') not in TERMINAL
-                or prior.get('observed_at_ns', 0) > result.get('observed_at_ns', 0)):
+                or (prior.get('observed_boot_id') and prior.get('observed_boot_id') == result.get('observed_boot_id')
+                    and prior.get('observed_at_ns', 0) > result.get('observed_at_ns', 0))):
             return
         if result.get('execution_observed'):
             confirm_dispatch(directory, meta, result['request_id'], 'native_execution')
@@ -422,7 +423,15 @@ def require_known_dispatch(directory):
             raise ValueError('Uncertain native dispatch; inspect retained status before any new submission. Nothing was redispatched.')
 
 
-def send(directory, task, submission_id=None):
+def send(directory, task, submission_id=None, controls=None):
+    # All entry points serialize controls and admission before acquiring existing locks.
+    with locked(directory / 'submission.lock'):
+        if controls is not None:
+            configure_idle(directory, controls)
+        return _send(directory, task, submission_id)
+
+
+def _send(directory, task, submission_id=None):
     if not task.strip():
         raise ValueError('Task file is empty')
     require_known_dispatch(directory)
@@ -520,6 +529,12 @@ def status(directory):
                 'failure_reason': 'backend_stopped_without_terminal_receipt',
                 'message': 'Native termination outcome is unknown; partial text/side effects are retained. Inspect before an explicit follow-up; nothing was replayed.'}
     latest = read(directory)
+    if result.get('request_id') != latest.get('current_request_id'):
+        # Never relabel an older observation as a newly admitted request.
+        result = latest.get('current_result') or {}
+        if result.get('request_id') != latest.get('current_request_id'):
+            result = {'request_id': latest.get('current_request_id'), 'status': 'incomplete',
+                      'failure_reason': 'request_advanced', 'text': ''}
     if latest.get('pending_dispatch'):
         result = {**result, 'status': 'incomplete', 'request_id': latest.get('current_request_id'),
                   'failure_reason': 'dispatch_unconfirmed', 'dispatch_status': 'pending',
@@ -737,8 +752,7 @@ def main(argv=None):
         batch.private_dir(batch.STATE)
         batch.private_dir(directory)
         if args.action in ('send', 'resume'):
-            configure_idle(directory, args)
-            result = send(directory, Path(args.task_file).read_text(), args.submission_id)
+            result = send(directory, Path(args.task_file).read_text(), args.submission_id, controls=args)
         elif args.action == 'wait':
             result = wait(directory)
         elif args.action in ('status', 'result'):
