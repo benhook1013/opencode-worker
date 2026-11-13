@@ -32,6 +32,13 @@ live = module('native_fixture_live', ROOT / 'live_worker.py')
 router = module('native_fixture_router', ROOT / 'cli_router.py')
 
 
+def git_fixture_environment():
+    return {key: value for key, value in os.environ.items()
+            if key not in {'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+                           'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+                           'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM'}}
+
+
 class FakeProvider(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -437,7 +444,7 @@ class NativeServerTests(unittest.TestCase):
         self.stop()  # Replace only this disposable fixture server with the managed owner.
         self.provider.mode = 'command'
         self.provider.requests.clear()
-        subprocess.run(['git', 'init', '-q', str(self.project)], check=True)
+        subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=git_fixture_environment())
         directory = self.root / ('e' * 32)
         directory.mkdir(mode=0o700)
         settings = transport.live_settings(self.settings, allow_commands=True,
@@ -1218,11 +1225,11 @@ class CompactionLineageTests(unittest.TestCase):
         self.assertNotIn('incomplete_reason', result)
         self.assertEqual(worker.exhaustion_reason(json.dumps({'type': 'error', 'error': result['error']})), 'credit_balance_exhausted')
 
-    def test_failed_compaction_alone_does_not_manufacture_execution_confirmation(self):
+    def test_owned_failed_compaction_alone_confirms_execution(self):
         messages = self.failed_compaction()
         result = self.snapshot([messages[0], *messages[2:]])
         self.assertEqual(result['status'], 'failed')
-        self.assertFalse(result['execution_observed'])
+        self.assertTrue(result['execution_observed'])
         self.assertEqual(result['text'], '')
 
     def test_unowned_compaction_error_cannot_replace_completed_handoff(self):

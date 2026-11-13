@@ -208,7 +208,7 @@ class NativeClient:
         candidates = request_assistants(messages, message_id)
         result = {'session_id': session_id, 'request_id': message_id, 'status': 'running' if native != 'idle' else 'queued',
                   'native_status': native, 'text': '', 'questions': questions, 'observed_at_ns': observed_at_ns, 'observed_boot_id': boot_id(),
-                  'execution_observed': any(not item['info'].get('summary') for item in candidates)}
+                  'execution_observed': bool(candidates)}
         if questions:
             result['status'] = 'needs_input'
         if not candidates:

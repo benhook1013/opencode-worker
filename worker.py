@@ -107,7 +107,11 @@ def instruction_paths(worktree, key=None):
         if any(resolved.is_relative_to(root) for root in protected):
             raise ValueError('Instruction file must not resolve into private credential or state directories')
         # Do not pass the original link to the native loader after checking its target.
-        paths.append(str(resolved))
+        # Native 1.19.5 globs only the basename of absolute instructions.
+        if any(char in resolved.name for char in '{}()!+@\\'):
+            raise ValueError('Unsupported glob characters in instruction filename; use a plain filename')
+        literal = re.sub(r'([*?\[\]])', r'[\1]', resolved.name)
+        paths.append(str(resolved.with_name(literal)))
     return paths
 
 

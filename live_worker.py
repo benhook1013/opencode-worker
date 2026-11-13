@@ -165,7 +165,9 @@ def remember(directory, result):
         if (prior.get('observed_boot_id') and prior.get('observed_boot_id') == result.get('observed_boot_id')
                 and prior.get('observed_at_ns', 0) > result.get('observed_at_ns', 0)):
             return
-        if prior.get('status') in TERMINAL and result.get('status') not in TERMINAL:
+        pending_question = (prior.get('incomplete_reason') == 'idle_unfinished_assistant'
+                            and result.get('status') == 'needs_input' and bool(result.get('questions')))
+        if prior.get('status') in TERMINAL and result.get('status') not in TERMINAL and not pending_question:
             if prior.get('incomplete_reason') == 'idle_unfinished_assistant':
                 # Keep the terminal receipt, but replace/invalidate stability evidence
                 # when a newer native observation shows changed output or activity.
@@ -224,6 +226,19 @@ def observe(directory, event, record=False):
                 'message': 'Recorded input crossed the long-context pricing boundary; early compaction is best effort.'})
 
 
+def checked_settings(directory, meta):
+    """Reject interrupted control commits before either owner launch path."""
+    settings = json.loads((directory / 'settings.json').read_text())
+    if (meta.get('controls_pending') or (meta.get('settings_sha256')
+            and meta['settings_sha256'] != settings_digest(settings))):
+        raise ValueError('Interrupted control update; reapply explicit controls before restarting')
+    return settings
+
+
+def settings_digest(settings):
+    return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+
+
 def run_server(directory):
     """One tiny native-process owner, with SSE observation and terminal-only idle reaping."""
     os.umask(0o077)
@@ -231,7 +246,7 @@ def run_server(directory):
     batch.STATE = directory.parent
     with locked(directory / 'server.lock', blocking=False):
         meta = read(directory)
-        settings = json.loads((directory / 'settings.json').read_text())
+        settings = checked_settings(directory, meta)
         env = batch.environment(directory, settings, meta.get('output_override'))
         env.update(meta.get('command_environment', {}))
         env['OPENCODE_SERVER_PASSWORD'] = server_password(directory)
@@ -412,6 +427,7 @@ def ensure_server(directory):
                 pass
         except BlockingIOError:
             raise ValueError('Native owner is still active but unresponsive; no backend was replaced or task replayed') from None
+        checked_settings(directory, meta)
         server_password(directory)
         update(directory, server_lifecycle='starting', server_error=None, stop_requested=False)
         with (directory / 'owner.log').open('ab') as log:
@@ -683,7 +699,7 @@ def start(args):
         password_file.write(secrets.token_urlsafe(32))
         password_file.flush()
         os.fsync(password_file.fileno())
-    atomic(directory / 'metadata.json', {'backend': 'native-server', 'start_spec_sha256': spec, 'status': 'starting', 'run_id': directory.name, 'worktree': worktree,
+    atomic(directory / 'metadata.json', {'backend': 'native-server', 'start_spec_sha256': spec, 'settings_sha256': settings_digest(settings), 'status': 'starting', 'run_id': directory.name, 'worktree': worktree,
         'model': model, 'reasoning': args.reasoning, 'model_limits': limits, 'model_limits_explicit': bool(args.context_window or args.model_output_limit),
         'allow_write': args.allow_write, 'allow_commands': args.allow_commands, 'long_context': args.long_context,
         'steps': steps, 'steps_explicit': steps is not None, 'output_override': budget, 'output_limit_explicit': budget is not None,
@@ -743,8 +759,10 @@ def configure_idle(directory, args):
         settings = live_settings(settings, allow_commands=meta.get('allow_commands', False), long_context=long_context,
             shell_plugin=(ROOT / 'command_environment.js').as_uri())
         settings['agent']['worker']['prompt'] = json.loads((directory / 'settings.json').read_text())['agent']['worker']['prompt']
+        # Mark the transaction first: failure at either following write must block launch.
+        update(directory, controls_pending=True)
         atomic(directory / 'settings.json', settings)
-        update(directory, steps=steps, steps_explicit=steps is not None, output_override=budget,
+        update(directory, controls_pending=False, settings_sha256=settings_digest(settings), steps=steps, steps_explicit=steps is not None, output_override=budget,
             output_limit_explicit=budget is not None, max_output_tokens=budget or min(32000, limits['output']),
             model_limits=limits, model_limits_explicit=bool(meta.get('model_limits_explicit') or args.context_window or args.model_output_limit),
             long_context=long_context, timeout_seconds=meta.get('timeout_seconds') if timeout is None else timeout or None)
