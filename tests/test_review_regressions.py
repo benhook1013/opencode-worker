@@ -202,6 +202,36 @@ class ReviewRegressions(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unexpected plugin dependency link'):
             worker.environment(self.directory, {'plugin': ['file:///fixture.js']})
 
+    def test_shutdown_starting_is_not_reported_stopped(self):
+        live.update(self.directory, server_lifecycle='starting')
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'client') as api:
+            with self.assertRaisesRegex(ValueError, 'Backend is starting'):
+                live.main(['shutdown', self.directory.name])
+        api.assert_not_called()
+        self.assertEqual(live.read(self.directory)['server_lifecycle'], 'starting')
+
+    def test_quiet_owner_ticks_keep_one_subscription(self):
+        import threading
+        release = threading.Event()
+        stopping = threading.Event()
+        api = mock.Mock()
+        def events(**kwargs):
+            yield {'type': 'server.connected'}
+            release.wait(2)
+            yield {'type': 'session.idle'}
+        api.events.side_effect = events
+        stream = live.owner_events(api, stopping, interval=0.01)
+        try:
+            self.assertEqual(next(stream)['type'], 'server.connected')
+            for _ in range(3):
+                self.assertEqual(next(stream)['type'], 'observer.tick')
+            api.events.assert_called_once_with(timeout=15)
+            release.set()
+            self.assertEqual(next(stream)['type'], 'session.idle')
+        finally:
+            release.set()
+            stream.close()
+
     def test_shutdown_publishes_intent_before_abort(self):
         api = mock.Mock()
         api.abort.side_effect = lambda session: self.assertTrue(live.read(self.directory)['stop_requested'])

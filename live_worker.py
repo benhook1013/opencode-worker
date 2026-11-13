@@ -6,6 +6,7 @@ import json
 import hashlib
 import re
 import os
+import queue
 from pathlib import Path
 import resource
 import secrets
@@ -251,13 +252,16 @@ def run_server(directory):
                 update(directory, server_url=url)
                 api = client(directory)
                 session = meta.get('session_id') or api.create_session()
-                update(directory, session_id=session, server_lifecycle='running', stop_requested=False)
+                current = update(directory, session_id=session, server_lifecycle='running')
+                if current.get('stop_requested'):
+                    stopping.set()
                 idle_since = None
                 last_snapshot = float('-inf')
                 while process.poll() is None and not stopping.is_set():
                     try:
-                        for event in api.events(timeout=1):
-                            observe(directory, event, record=True)
+                        for event in owner_events(api, stopping):
+                            if event.get('type') != 'observer.tick':
+                                observe(directory, event, record=True)
                             meta = read(directory)
                             if meta.get('observer_state') != 'connected':
                                 meta = update(directory, observer_state='connected')
@@ -314,6 +318,46 @@ def run_server(directory):
             update(directory, server_lifecycle='stopped', owner_pid=None, native_server_pid=None)
 
 
+def owner_events(api, stopping, interval=1):
+    """Keep the SSE subscription open while supplying independent reconciliation ticks."""
+    pending = queue.Queue(maxsize=128)
+    closed = threading.Event()
+
+    def deliver(item):
+        while not closed.is_set() and not stopping.is_set():
+            try:
+                pending.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+    def receive():
+        try:
+            # Longer than the native ten-second heartbeat, not the reconciliation interval.
+            for event in api.events(timeout=15):
+                if closed.is_set() or stopping.is_set():
+                    break
+                deliver((event, None))
+        except Exception as error:
+            deliver((None, error))
+        finally:
+            deliver((None, ConnectionError('Native event stream closed')))
+
+    threading.Thread(target=receive, daemon=True).start()
+    try:
+        while not stopping.is_set():
+            try:
+                event, error = pending.get(timeout=interval)
+            except queue.Empty:
+                yield {'type': 'observer.tick'}
+                continue
+            if error:
+                raise error
+            yield event
+    finally:
+        closed.set()
+
+
 def ensure_server(directory):
     meta = read(directory)
     if meta.get('server_lifecycle') == 'running':
@@ -340,7 +384,7 @@ def ensure_server(directory):
         except BlockingIOError:
             raise ValueError('Native owner is still active but unresponsive; no backend was replaced or task replayed') from None
         server_password(directory)
-        update(directory, server_lifecycle='starting', server_error=None)
+        update(directory, server_lifecycle='starting', server_error=None, stop_requested=False)
         with (directory / 'owner.log').open('ab') as log:
             subprocess.Popen([sys.executable, '-I', str(ROOT / 'live_worker.py'), '_serve', str(directory)],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
@@ -708,6 +752,8 @@ def main(argv=None):
             with locked(directory / 'control.lock'):
                 meta = read(directory)
                 if args.action == 'shutdown':
+                    if meta.get('server_lifecycle') == 'starting':
+                        raise ValueError('Backend is starting; retry shutdown after it reports running or stopped')
                     update(directory, stop_requested=True)
                 if meta.get('server_lifecycle') == 'running':
                     api = client(directory)

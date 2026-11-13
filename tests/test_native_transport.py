@@ -450,6 +450,8 @@ class NativeServerTests(unittest.TestCase):
             'allow_commands': True, 'server_lifecycle': 'new', 'idle_reap_seconds': 0.1})
         context = multiprocessing.get_context('fork')
         def launch_owner():
+            # Match ensure_server: clear the previous owner's stop flag before launch.
+            live.update(directory, server_lifecycle='starting', stop_requested=False)
             def target():
                 original_events, original_snapshot = live.NativeClient.events, live.NativeClient.snapshot
                 faults = {'injected': False, 'second': False}
