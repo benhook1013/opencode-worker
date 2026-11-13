@@ -88,12 +88,43 @@ class LauncherTests(unittest.TestCase):
             (project / 'AGENTS.md').write_text('Project fixture instructions')
             (project / 'nested').mkdir()
             (project / 'nested/AGENTS.md').write_text('Nested instructions: inspect before edits')
-            settings = worker.config('openai/gpt-6-luna', 'high', False, 8, root / 'dummy', worktree=project)
+            settings = worker.config('openai/gpt-6-luna', 'high', False, 8, root / 'credentials/dummy', worktree=project)
             self.assertEqual(settings['instructions'][-2:], [str(root / 'AGENTS.md'), str(project / 'AGENTS.md')])
             self.assertNotIn(str(project / 'nested/AGENTS.md'), settings['instructions'])
             self.assertTrue(all(Path(path).is_absolute() for path in settings['instructions']))
             self.assertIn('read all applicable nested AGENTS.md', settings['agent']['worker']['prompt'])
             self.assertEqual(worker.environment(root, settings)['OPENCODE_DISABLE_PROJECT_CONFIG'], 'true')
+
+    def test_instruction_symlinks_cannot_target_private_roots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / 'project'
+            project.mkdir()
+            state = root / 'state'
+            credentials = root / 'credentials'
+            for directory in (state, credentials):
+                directory.mkdir()
+            key = credentials / 'dummy-key'
+            key.write_text('dummy-only')
+            state_file = state / 'dummy-state'
+            state_file.write_text('dummy-only')
+            alias = root / 'alias'
+            alias.symlink_to(credentials, target_is_directory=True)
+            with mock.patch.object(worker, 'KEY', key), mock.patch.object(worker, 'STATE', state):
+                for target in (key, state_file, alias / 'dummy-key'):
+                    link = project / 'AGENTS.md'
+                    link.symlink_to(target)
+                    with self.assertRaisesRegex(ValueError, 'private credential or state'):
+                        worker.config('openai/gpt-6-luna', 'high', False, key=key, worktree=project)
+                    link.unlink()
+                allowed = root / 'shared-instructions'
+                allowed.write_text('Legitimate fixture instructions')
+                (project / 'AGENTS.md').symlink_to(allowed)
+                settings = worker.config('openai/gpt-6-luna', 'high', False, key=key, worktree=project)
+                self.assertEqual(settings['instructions'][-1], str(allowed.resolve()))
+                (project / 'AGENTS.md').unlink()
+                (project / 'AGENTS.md').symlink_to(key)
+                self.assertEqual(Path(settings['instructions'][-1]).read_text(), 'Legitimate fixture instructions')
 
 
 class CreditGuardTests(unittest.TestCase):

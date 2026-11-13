@@ -74,10 +74,20 @@ def validate_worktree(value):
     return directory
 
 
-def instruction_paths(worktree):
+def instruction_paths(worktree, key=None):
     directory = Path(worktree).resolve(strict=True)
-    return [str(candidate) for ancestor in reversed((directory, *directory.parents))
-            if (candidate := ancestor / 'AGENTS.md').is_file()]
+    protected = ((KEY if key is None else Path(key)).parent.resolve(), STATE.resolve())
+    paths = []
+    for ancestor in reversed((directory, *directory.parents)):
+        candidate = ancestor / 'AGENTS.md'
+        if not candidate.is_file():
+            continue
+        resolved = candidate.resolve(strict=True)
+        if any(resolved.is_relative_to(root) for root in protected):
+            raise ValueError('Instruction file must not resolve into private credential or state directories')
+        # Do not pass the original link to the native loader after checking its target.
+        paths.append(str(resolved))
+    return paths
 
 
 def config(model, reasoning, writable, steps=None, key=KEY, worktree=None, limits=None, long_context=False):
@@ -91,7 +101,7 @@ def config(model, reasoning, writable, steps=None, key=KEY, worktree=None, limit
                   'external_directory': 'deny', 'edit': 'allow' if writable else 'deny'}
     return {
         'model': model, 'small_model': model, 'default_agent': 'worker',
-        'instructions': instruction_paths(worktree) if worktree is not None else [],
+        'instructions': instruction_paths(worktree, key) if worktree is not None else [],
         'enabled_providers': ['openai'], 'share': 'disabled', 'autoupdate': False,
         'snapshot': False, 'plugin': [], 'mcp': {}, 'command': {}, 'lsp': False,
         'formatter': False, 'compaction': compaction, 'permission': permission,
