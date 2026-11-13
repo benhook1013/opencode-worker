@@ -44,11 +44,29 @@ VERIFIED_MODEL_LIMITS = {
 }
 
 
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def private_dir(path):
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    missing = []
+    parent = path
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError(f'Expected owned private directory (0700): {path}')
+    # Also sync existing ancestors: a previous failed attempt may have created an
+    # entry but failed before syncing it. Never dispatch on that retry shortcut.
+    for parent in path.absolute().parents:
+        sync_directory(parent)
 
 
 def credential_check(path=KEY):
@@ -261,6 +279,18 @@ def credit_save(exhausted, reason):
         if os.path.exists(filename):
             os.unlink(filename)
     return value
+
+
+def credit_latch(reason):
+    """Caller holds credit_lock; failed persistence must not leave an open guard."""
+    credit_state()
+    try:
+        return credit_save(True, reason)
+    except (OSError, ValueError):
+        # Missing guards already fail closed and require explicit owner reset.
+        (STATE / 'credit-guard.json').unlink(missing_ok=True)
+        sync_directory(STATE)
+        raise
 
 
 def credit_preflight():
@@ -537,8 +567,7 @@ def execute(args):
             if reason:
                 try:
                     with credit_lock():
-                        credit_state()  # Unexpected corruption stays closed until explicit owner reset.
-                        credit_save(True, reason)
+                        credit_latch(reason)
                 except (OSError, ValueError) as error:
                     latch_error = error
                     meta['credit_latch_error'] = type(error).__name__

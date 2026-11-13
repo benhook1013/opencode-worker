@@ -403,6 +403,7 @@ class ReviewRegressions(unittest.TestCase):
     def test_shutdown_publishes_intent_before_abort(self):
         api = mock.Mock()
         api.abort.side_effect = lambda session: self.assertTrue(live.read(self.directory)['stop_requested'])
+        api.snapshot.return_value = {'request_id': 'm', 'status': 'interrupted', 'text': 'retained'}
         api.request.return_value = {}
         def stopped(*args):
             live.update(self.directory, server_lifecycle='stopped')

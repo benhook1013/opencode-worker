@@ -190,11 +190,29 @@ def remember(directory, result):
         meta.update(status=result['status'], current_result=result)
         atomic(directory / 'metadata.json', meta)
     if result.get('error'):
-        reason = batch.exhaustion_reason(json.dumps({'type': 'error', 'error': result['error']}))
-        if reason:
-            with batch.credit_lock():
-                batch.credit_state()
-                batch.credit_save(True, reason)
+        latch_request_error(directory, result['error'], result['request_id'])
+
+
+def latch_request_error(directory, error, request_id=None):
+    """Latch each request/reason once, so retained failures cannot undo an owner reset."""
+    reason = batch.exhaustion_reason(json.dumps({'type': 'error', 'error': error}))
+    if not reason:
+        return
+    # Same order as dispatch: credit then metadata. Keep reset serialized until
+    # the successful latch is durably attributed to its original request.
+    with batch.credit_lock():
+        with locked(directory / 'metadata.lock'):
+            meta = read(directory)
+            message = request_id or meta.get('current_request_id')
+            if request_id and request_id != meta.get('current_request_id'):
+                return
+            identity = [meta.get('session_id'), message, reason]
+            latched = meta.get('credit_latched_errors', [])
+            if identity in latched:
+                return
+            batch.credit_latch(reason)
+            meta['credit_latched_errors'] = [*latched, identity]
+            atomic(directory / 'metadata.json', meta)
 
 
 def observe(directory, event, record=False):
@@ -211,11 +229,7 @@ def observe(directory, event, record=False):
                 meta['session_error'] = {'request_id': message, 'error': error, 'attribution': 'explicit_message_id'}
                 atomic(directory / 'metadata.json', meta)
     if error:
-        reason = batch.exhaustion_reason(json.dumps({'type': 'error', 'error': error}))
-        if reason:
-            with batch.credit_lock():
-                batch.credit_state()
-                batch.credit_save(True, reason)
+        latch_request_error(directory, error, props.get('messageID'))
     part = props.get('part', {})
     tokens = part.get('tokens')
     if part.get('type') == 'step-finish' and isinstance(tokens, dict):
@@ -844,6 +858,10 @@ def main(argv=None):
                             if time.monotonic() >= deadline:
                                 raise ValueError('Native cancellation cleanup not confirmed; backend retained for inspection')
                             time.sleep(0.05)
+                        # Retain the terminal receipt before the owner's signal
+                        # handler can stop observing the native session.
+                        if meta.get('current_request_id'):
+                            remember(directory, api.snapshot(meta['session_id'], meta['current_request_id']))
                         if not signal_owned(meta, 'owner', signal.SIGTERM):
                             signal_owned(meta, 'native_server', signal.SIGTERM)
                         while read(directory).get('server_lifecycle') != 'stopped' and time.monotonic() < deadline:

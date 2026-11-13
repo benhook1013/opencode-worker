@@ -37,6 +37,24 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(worker.config('openai/gpt-6-luna', 'high', True, 8)['permission']['edit'], 'allow')
             del os.environ['OPENAI_API_KEY']
 
+    def test_private_directory_syncs_new_ancestors_and_retry_before_use(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'state' / 'worker' / 'turn'
+            real_sync = worker.sync_directory
+            synced = []
+            def sync(directory):
+                synced.append(directory)
+                real_sync(directory)
+            with mock.patch.object(worker, 'sync_directory', side_effect=sync):
+                worker.private_dir(path)
+                self.assertEqual(synced[:3], [path.parent, path.parent.parent, Path(temp)])
+                synced.clear()
+                worker.private_dir(path)
+                self.assertEqual(synced[:3], [path.parent, path.parent.parent, Path(temp)])
+            with mock.patch.object(worker, 'sync_directory', side_effect=OSError('sync failure')):
+                with self.assertRaisesRegex(OSError, 'sync failure'):
+                    worker.private_dir(path)
+
     def test_credential_metadata_rejects_insecure_file_and_symlink(self):
         with tempfile.TemporaryDirectory() as temp:
             key = Path(temp) / 'dummy'
@@ -343,6 +361,10 @@ class CreditGuardTests(unittest.TestCase):
                 self.assertEqual(meta['credit_latch_error'], 'ValueError' if failure == 'state' else 'OSError')
                 self.assertIn('finished_at', meta)
                 self.assertEqual((path.parent / meta['latest_turn'] / 'result.txt').read_text(), 'Fixture done')
+                if failure == 'save':
+                    with self.assertRaisesRegex(ValueError, 'dispatch refused'):
+                        worker.credit_preflight()
+                    worker.credit_save(False, None)
 
     def test_batch_overflow_recovery_preserves_native_exit_code(self):
         overflow = {'type': 'error', 'error': {'name': 'ContextOverflowError'}}
