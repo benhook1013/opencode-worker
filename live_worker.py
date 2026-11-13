@@ -594,6 +594,15 @@ def wait_result(directory, result, request_id):
         if meta.get('current_request_id') != request_id:
             result = {'status': 'superseded', 'request_id': request_id,
                       'next_request_id': meta.get('current_request_id')}
+        else:
+            retained = meta.get('current_result') or {}
+            if (retained.get('request_id') == request_id
+                    and ((retained.get('observed_boot_id')
+                          and retained.get('observed_boot_id') == result.get('observed_boot_id')
+                          and retained.get('observed_at_ns', 0) > result.get('observed_at_ns', 0))
+                         or (retained.get('status') in TERMINAL
+                             and result.get('status') not in TERMINAL))):
+                result = retained
         return {**result, 'run_id': directory.name, 'pricing_warning': meta.get('pricing_warning')}
 
 
@@ -712,7 +721,8 @@ def configure_idle(directory, args):
             else:
                 state = {'native_status': api.request('GET', '/session/status').get(meta['session_id'], {'type': 'idle'})['type'],
                          'questions': api.questions(meta['session_id'])}
-            if state['native_status'] != 'idle' or state['questions']:
+            if (state['native_status'] != 'idle' or state['questions']
+                    or (meta.get('current_request_id') and state.get('status') not in TERMINAL)):
                 raise ValueError('Control overrides require an idle worker; send without overrides to follow up live')
             # Stop only this idle managed backend; the native DB/session remains.
             signal_owned(meta, 'owner', signal.SIGTERM)
@@ -762,7 +772,7 @@ def main(argv=None):
             'long-context': 'Opt in to full-window native compaction policy'}[flag]
         new.add_argument('--' + flag, action='store_true', help=help_text)
     for flag in ('max-output-tokens', 'max-steps', 'context-window', 'model-output-limit', 'timeout'):
-        new.add_argument('--' + flag, type=int)
+        new.add_argument('--' + flag, type=int, help=('Advisory native step target, not an enforced tool-call cap; 0 clears saved target' if flag == 'max-steps' else None))
     for name in ('send', 'resume', 'wait', 'status', 'result', 'cancel', 'shutdown', 'reply'):
         item = sub.add_parser(name)
         item.add_argument('run_id', type=batch.run_id)
@@ -770,7 +780,7 @@ def main(argv=None):
             item.add_argument('--task-file', required=True)
             item.add_argument('--submission-id', help='Same key/task returns the prior receipt without replay')
             for flag in ('max-output-tokens', 'max-steps', 'context-window', 'model-output-limit', 'timeout'):
-                item.add_argument('--' + flag, type=int)
+                item.add_argument('--' + flag, type=int, help=('Advisory native step target, not an enforced tool-call cap; 0 clears saved target' if flag == 'max-steps' else None))
             item.add_argument('--long-context', action=argparse.BooleanOptionalAction, default=None)
         if name == 'reply':
             item.add_argument('--question-id', required=True)

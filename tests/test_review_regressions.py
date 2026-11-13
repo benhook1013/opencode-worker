@@ -58,6 +58,34 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(live.read(self.directory)['current_result'], done)
         self.assertEqual((self.turn / 'result.txt').read_text(), 'done')
 
+    def test_wait_returns_newer_retained_result_for_same_cursor(self):
+        live.update(self.directory, pricing_warning='fixture warning')
+        stale = {'request_id': 'm', 'status': 'needs_input', 'questions': ['answered'],
+                 'observed_at_ns': 10, 'observed_boot_id': 'boot-one'}
+        done = {'request_id': 'm', 'status': 'complete', 'text': 'done',
+                'observed_at_ns': 20, 'observed_boot_id': 'boot-one'}
+        live.remember(self.directory, done)
+        live.remember(self.directory, stale)
+        result = live.wait_result(self.directory, stale, 'm')
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['text'], 'done')
+        self.assertNotIn('questions', result)
+        self.assertEqual(result['run_id'], self.directory.name)
+        self.assertEqual(result['pricing_warning'], 'fixture warning')
+        live.update(self.directory, current_request_id='next')
+        self.assertEqual(live.wait_result(self.directory, stale, 'm')['status'], 'superseded')
+
+    def test_controls_do_not_stop_queued_idle_request(self):
+        from argparse import Namespace
+        api = mock.Mock()
+        api.snapshot.return_value = {'request_id': 'm', 'status': 'queued',
+                                     'native_status': 'idle', 'questions': []}
+        with mock.patch.object(live, 'client', return_value=api), mock.patch.object(live, 'signal_owned') as stop:
+            with self.assertRaisesRegex(ValueError, 'idle worker'):
+                live.configure_idle(self.directory, Namespace(max_steps=3))
+        stop.assert_not_called()
+        self.assertEqual(live.read(self.directory)['server_lifecycle'], 'running')
+
     def test_new_boot_observation_replaces_old_monotonic_time(self):
         live.remember(self.directory, {'request_id': 'm', 'status': 'running', 'text': 'old',
             'observed_at_ns': 9999, 'observed_boot_id': 'previous-boot'})

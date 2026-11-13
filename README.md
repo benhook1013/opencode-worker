@@ -54,12 +54,15 @@ The sole provider credential is `openai-api-key` in the configured config direct
 
 | Control | Current behavior |
 | --- | --- |
-| Whole-task time and steps | Unlimited by default. Optional positive `--timeout` or `--max-steps`; zero clears a saved restriction. No one-hour ceiling. |
+| Whole-task time | Unlimited by default. Optional positive `--timeout` requests cancellation after the elapsed deadline; zero clears a saved timeout. No one-hour ceiling. |
+| Advisory steps | `--max-steps` passes a positive target to native `agent.steps`; zero clears the saved target. This is not an enforced step or tool-call cap. |
 | Per-response output | Native OpenCode default, currently up to 32,000 reasoning-plus-output tokens; not a whole-task cap. Optional `--max-output-tokens` up to model maximum; zero restores native behavior. |
 | Model metadata | Verified gpt-6-luna/gpt-6.1-sol: 1,050,000 context and 128,000 maximum output. Other IDs require documented `--context-window` and `--model-output-limit`. No model substitution. |
 | Cost-aware compaction | Native compaction near 250,000 total tokens by default, using truthful model input upper bound and an 800,000-token reserve. `--long-context` opts into full-window policy; `--no-long-context` restores early compaction. Compaction uses the same selected model/provider. |
 | Request timing | No launcher 120-second request override. Native OpenCode still has 300-second response-header/stream-idle defaults. |
 | Resume controls | Known explicit overrides persist. Legacy implicit 8-step/4096/32768 output restrictions are dropped. New provenance is stored. Changing controls requires an idle backend; live follow-up without overrides does not stop it. |
+
+In pinned OpenCode 1.19.5, reaching `agent.steps` adds `MAX_STEPS_PROMPT`, asking the model to finish, but leaves tools enabled. A model can continue making tool calls beyond that target. Do not use `--max-steps` as a hard execution, cost, or safety boundary. Use permissions to restrict capabilities; `--timeout` requests cancellation but is not a spend guarantee. This applies to both batch and live workers. [Pinned native implementation](https://github.com/anomalyco/opencode/blob/v1.19.5/packages/opencode/src/session/prompt.ts#L1178-L1285).
 
 For the two documented models above, API prompts over 272,000 input tokens have higher full-request pricing (2× input/cache rates and 1.5× output rates). Early compaction is **best effort**: input/tool jumps and the compaction request can still cross that boundary. Recorded crossings produce a structured pricing warning. Neither context metadata nor compaction is a hard billing guard; no balance/account API is used.
 

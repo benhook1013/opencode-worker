@@ -363,7 +363,7 @@ def step_limit(args, meta):
     if value == 0 and type(value) is int:
         return None
     if value is not None and (type(value) is not int or value < 1):
-        raise ValueError('Max steps must be positive, or 0 for native unrestricted steps')
+        raise ValueError('Max steps target must be positive, or 0 for native unrestricted steps')
     return value
 
 
@@ -553,7 +553,7 @@ def main():
                              help='Opt in to full native context policy; default early compaction near 250k total tokens')
         command.add_argument('--max-output-tokens', type=int, default=None,
                              help='Opt-in reasoning/output cap up to model maximum; 0 clears saved cap; default native OpenCode behavior')
-        command.add_argument('--max-steps', type=int, default=None, help='Opt-in agent step cap; 0 clears saved cap; default unrestricted')
+        command.add_argument('--max-steps', type=int, default=None, help='Advisory native step target, not an enforced tool-call cap; 0 clears saved target; default unrestricted')
         command.add_argument('--context-window', type=int, help='Documented model context tokens; required for unknown model IDs')
         command.add_argument('--model-output-limit', type=int, help='Documented model maximum output tokens; required for unknown model IDs')
         command.add_argument('--timeout', type=int, default=None, help='Opt-in wall-clock seconds; 0 or omitted means unlimited (native request timeouts still apply)')
