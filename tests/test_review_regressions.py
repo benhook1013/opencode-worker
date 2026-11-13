@@ -55,6 +55,43 @@ class ReviewRegressions(unittest.TestCase):
         live.enforce_timeout(self.directory, api, 's')
         api.abort.assert_called_once_with('s')
 
+    def test_timeout_rereads_request_after_control_lock(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        original_lock = live.locked
+        @contextlib.contextmanager
+        def replacing_lock(path, **kwargs):
+            with original_lock(path, **kwargs):
+                if path.name == 'control.lock':
+                    live.update(self.directory, current_request_id='replacement', submitted_at=time.time())
+                yield
+        api = mock.Mock()
+        with mock.patch.object(live, 'locked', side_effect=replacing_lock):
+            live.enforce_timeout(self.directory, api, 's')
+        api.abort.assert_not_called()
+
+    def test_distinct_send_retains_previous_terminal_result(self):
+        api = mock.Mock()
+        api.snapshot.return_value = {'request_id': 'm', 'status': 'complete',
+            'native_status': 'idle', 'text': 'final prior result'}
+        api.stage.side_effect = ValueError('fixture stop after retention')
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'ensure_server'), mock.patch.object(live, 'client', return_value=api):
+            with worker.credit_lock(): worker.credit_save(False, None)
+            with self.assertRaisesRegex(ValueError, 'fixture stop'):
+                live.send(self.directory, 'new task', 'new')
+        self.assertEqual((self.turn / 'result.txt').read_text(), 'final prior result')
+        self.assertEqual(json.loads((self.turn / 'status.json').read_text())['status'], 'complete')
+
+    def test_controls_reject_starting_backend(self):
+        from argparse import Namespace
+        live.update(self.directory, server_lifecycle='starting')
+        args = Namespace(max_steps=3)
+        original_lock = live.locked
+        with mock.patch.object(live, 'locked', wraps=original_lock) as lock:
+            with self.assertRaisesRegex(ValueError, 'backend is starting'):
+                live.configure_idle(self.directory, args)
+        self.assertIn(mock.call(self.directory / 'launch.lock'), lock.call_args_list)
+        self.assertEqual(live.read(self.directory)['server_lifecycle'], 'starting')
+
     def test_orphan_backend_is_rejected(self):
         api = mock.Mock()
         api.request.return_value = {'healthy': True}
@@ -197,7 +234,8 @@ class ReviewRegressions(unittest.TestCase):
 
     def test_local_hook_rejects_unexpected_dependency_link(self):
         config = self.directory / 'home/config/opencode'
-        config.mkdir(parents=True)
+        (self.directory / 'home').mkdir(mode=0o700)
+        config.mkdir(parents=True, mode=0o700)
         (config / 'node_modules').symlink_to(self.root)
         with self.assertRaisesRegex(ValueError, 'Unexpected plugin dependency link'):
             worker.environment(self.directory, {'plugin': ['file:///fixture.js']})

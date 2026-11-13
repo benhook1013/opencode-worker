@@ -105,12 +105,13 @@ def owner_alive(meta):
     return bool(pid and ticks and process_identity(pid) == ticks)
 
 
-def enforce_timeout(directory, api, session):
-    meta = read(directory)
-    if (meta.get('timeout_seconds') and meta.get('current_request_id')
-            and (meta.get('current_result') or {}).get('status') not in TERMINAL
-            and time.time() - meta.get('submitted_at', time.time()) >= meta['timeout_seconds']):
-        api.abort(session)
+def enforce_timeout(directory, api, session, stopping=None):
+    with locked(directory / 'control.lock', stopping=stopping):
+        meta = read(directory)
+        if (meta.get('timeout_seconds') and meta.get('current_request_id')
+                and (meta.get('current_result') or {}).get('status') not in TERMINAL
+                and time.time() - meta.get('submitted_at', time.time()) >= meta['timeout_seconds']):
+            api.abort(session)
 
 
 def client(directory):
@@ -278,8 +279,7 @@ def run_server(directory):
                             terminal = result is None or result['status'] in TERMINAL
                             idle = terminal and (result is None or result['native_status'] == 'idle')
                             idle_since = (idle_since or time.monotonic()) if idle else None
-                            if meta.get('timeout_seconds') and not terminal and time.time() - meta.get('submitted_at', time.time()) >= meta['timeout_seconds']:
-                                api.abort(session)
+                            enforce_timeout(directory, api, session, stopping=stopping)
                             if idle_since is not None and time.monotonic() - idle_since >= (meta.get('idle_reap_seconds', 30) if message else 30):
                                 with locked(directory / 'control.lock', stopping=stopping):
                                     latest = read(directory)
@@ -295,7 +295,7 @@ def run_server(directory):
                         update(directory, observer_state='degraded')
                         # Reconcile retained native state after transport loss; never replay a prompt.
                         try:
-                            enforce_timeout(directory, api, session)
+                            enforce_timeout(directory, api, session, stopping=stopping)
                             latest = read(directory)
                             if latest.get('current_request_id'):
                                 configure_dispatch(directory, api, latest)
@@ -455,6 +455,7 @@ def send(directory, task, submission_id=None):
             current = api.snapshot(meta['session_id'], meta['current_request_id'])
             if current['status'] not in TERMINAL or current.get('native_status') != 'idle':
                 raise ValueError('Prior request is still active; wait or cancel before a distinct submission')
+            remember(directory, current)
         turn = directory / ('turn-' + uuid.uuid4().hex)
         batch.private_dir(turn)
         (turn / 'task.txt').write_text(task)
@@ -648,10 +649,12 @@ def configure_idle(directory, args):
     fields = ('max_steps', 'max_output_tokens', 'context_window', 'model_output_limit', 'timeout', 'long_context')
     if not any(getattr(args, field, None) is not None for field in fields):
         return
-    with locked(directory / 'control.lock'):
+    with locked(directory / 'control.lock'), locked(directory / 'launch.lock'):
         meta = read(directory)
         if meta.get('pending_submission') or meta.get('pending_dispatch'):
             raise ValueError('Pending native submission is uncertain; inspect retained state before changing controls')
+        if meta.get('server_lifecycle') == 'starting':
+            raise ValueError('Native backend is starting; retry controls after it is running or stopped')
         if meta.get('server_lifecycle') == 'running':
             api = client(directory)
             if meta.get('current_request_id'):

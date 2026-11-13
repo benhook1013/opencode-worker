@@ -318,6 +318,40 @@ class CreditGuardTests(unittest.TestCase):
         self.assertEqual((code, meta['status']), (124, 'interrupted'))
         self.assertNotIn('incomplete_reason', meta)
 
+    def test_repeated_sigterm_during_cleanup_preserves_escalation_and_metadata(self):
+        previous = worker.signal.getsignal(worker.signal.SIGTERM)
+        for first in (KeyboardInterrupt(), worker.subprocess.TimeoutExpired('fixture', 1)):
+            with self.subTest(first=type(first).__name__):
+                process = mock.Mock(pid=12345, returncode=-9)
+                process.communicate.side_effect = first
+                waits = []
+                def wait(timeout=None):
+                    self.assertEqual(worker.signal.getsignal(worker.signal.SIGTERM), worker.signal.SIG_IGN)
+                    # A real repeated signal must be harmless during both waits.
+                    worker.signal.raise_signal(worker.signal.SIGTERM)
+                    waits.append(timeout)
+                    if timeout is not None:
+                        raise worker.subprocess.TimeoutExpired('fixture', timeout)
+                    return -9
+                process.wait.side_effect = wait
+                original_save = worker.save
+                def save(path, value):
+                    if value.get('status') == 'interrupted':
+                        self.assertEqual(worker.signal.getsignal(worker.signal.SIGTERM), worker.signal.SIG_IGN)
+                        worker.signal.raise_signal(worker.signal.SIGTERM)
+                    return original_save(path, value)
+                with mock.patch.object(worker.subprocess, 'Popen', return_value=process), \
+                        mock.patch.object(worker.os, 'killpg') as kill, \
+                        mock.patch.object(worker, 'save', side_effect=save):
+                    code, meta = self.native_fixture('')
+                self.assertEqual((code, meta['status']), (124, 'interrupted'))
+                self.assertEqual(waits, [3, None])
+                self.assertEqual(kill.call_args_list, [mock.call(12345, worker.signal.SIGTERM),
+                                                       mock.call(12345, worker.signal.SIGKILL)])
+                saved = json.loads((Path(meta['artifacts']).parent / 'metadata.json').read_text())
+                self.assertEqual(saved['status'], 'interrupted')
+                self.assertEqual(worker.signal.getsignal(worker.signal.SIGTERM), previous)
+
     def test_native_defaults_compaction_and_request_timeouts(self):
         settings = worker.config('openai/gpt-6-luna', 'high', False)
         self.assertNotIn('steps', settings['agent']['worker'])

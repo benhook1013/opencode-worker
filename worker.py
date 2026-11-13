@@ -419,66 +419,69 @@ def execute(args):
         if args.action == 'resume':
             command += ['--session', meta['session_id']]
         code, status = 1, 'failed'
-        with (turn / 'events.jsonl').open('wb') as output, (turn / 'stderr.log').open('wb') as error:
-            env = environment(directory, settings, max_output_tokens=budget)
-            # Serialize the final check and launch against completed exhaustion writes.
-            with credit_lock():
-                credit_preflight()
-                meta.update(status='running', latest_turn=turn.name, started_at=time.time())
-                save(directory / 'metadata.json', meta)
-                try:
-                    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=error,
-                                            cwd=worktree, env=env, start_new_session=True)
-                except OSError as launch_error:
-                    (turn / 'result.txt').write_text('')
-                    meta.update(status='failed', exit_code=1, finished_at=time.time(),
-                                failure_reason='native_launch_failed', launch_error=type(launch_error).__name__)
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        try:
+            with (turn / 'events.jsonl').open('wb') as output, (turn / 'stderr.log').open('wb') as error:
+                env = environment(directory, settings, max_output_tokens=budget)
+                # Serialize the final check and launch against completed exhaustion writes.
+                with credit_lock():
+                    credit_preflight()
+                    meta.update(status='running', latest_turn=turn.name, started_at=time.time())
                     save(directory / 'metadata.json', meta)
-                    raise
-            previous_sigterm = signal.getsignal(signal.SIGTERM)
-            def terminate(_signum, _frame):
-                raise KeyboardInterrupt()
-            signal.signal(signal.SIGTERM, terminate)
-            try:
-                proc.communicate(task.encode(), timeout=timeout)
-                code = proc.returncode
-                status = 'complete' if code == 0 else 'failed'
-            except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=error,
+                                                cwd=worktree, env=env, start_new_session=True)
+                    except OSError as launch_error:
+                        (turn / 'result.txt').write_text('')
+                        meta.update(status='failed', exit_code=1, finished_at=time.time(),
+                                    failure_reason='native_launch_failed', launch_error=type(launch_error).__name__)
+                        save(directory / 'metadata.json', meta)
+                        raise
+                def terminate(_signum, _frame):
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    raise KeyboardInterrupt()
+                signal.signal(signal.SIGTERM, terminate)
                 try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
-                status, code = 'interrupted', 124
-            finally:
-                signal.signal(signal.SIGTERM, previous_sigterm)
-        meta['native_child_peak_rss_kib'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-        events = (turn / 'events.jsonl').read_text(errors='replace')
-        reason = exhaustion_reason(events)
-        if reason:
-            with credit_lock():
-                credit_state()  # Unexpected corruption stays closed until explicit owner reset.
-                credit_save(True, reason)
-            meta['credit_exhaustion_reason'] = reason
-            print(f'api-worker: {reason}; shared API dispatch paused. Use native helpers until credits are verified available.', file=sys.stderr)
-        result, session_id, errors = collect(events)
-        meta['native_exit_code'] = proc.returncode
-        if status != 'interrupted' and errors:
-            status, code = 'failed', 1
-        elif status == 'complete':
-            incomplete = incomplete_reason(events)
-            if incomplete:
-                status, code = 'incomplete', 2
-                meta['incomplete_reason'] = incomplete
-                print(f'api-worker: incomplete turn ({incomplete}); inspect partial output and possible edits before explicit resume.', file=sys.stderr)
-        if session_id:
-            meta['session_id'] = session_id
-        (turn / 'result.txt').write_text(result)
-        meta.update(status=status, exit_code=code, finished_at=time.time())
-        save(directory / 'metadata.json', meta)
-        print(json.dumps({**meta, 'artifacts': str(turn)}))
-        return code
+                    proc.communicate(task.encode(), timeout=timeout)
+                    code = proc.returncode
+                    status = 'complete' if code == 0 else 'failed'
+                except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+                    status, code = 'interrupted', 124
+            meta['native_child_peak_rss_kib'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            events = (turn / 'events.jsonl').read_text(errors='replace')
+            reason = exhaustion_reason(events)
+            if reason:
+                with credit_lock():
+                    credit_state()  # Unexpected corruption stays closed until explicit owner reset.
+                    credit_save(True, reason)
+                meta['credit_exhaustion_reason'] = reason
+                print(f'api-worker: {reason}; shared API dispatch paused. Use native helpers until credits are verified available.', file=sys.stderr)
+            result, session_id, errors = collect(events)
+            meta['native_exit_code'] = proc.returncode
+            if status != 'interrupted' and errors:
+                status, code = 'failed', 1
+            elif status == 'complete':
+                incomplete = incomplete_reason(events)
+                if incomplete:
+                    status, code = 'incomplete', 2
+                    meta['incomplete_reason'] = incomplete
+                    print(f'api-worker: incomplete turn ({incomplete}); inspect partial output and possible edits before explicit resume.', file=sys.stderr)
+            if session_id:
+                meta['session_id'] = session_id
+            (turn / 'result.txt').write_text(result)
+            meta.update(status=status, exit_code=code, finished_at=time.time())
+            save(directory / 'metadata.json', meta)
+            print(json.dumps({**meta, 'artifacts': str(turn)}))
+            return code
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def main():
