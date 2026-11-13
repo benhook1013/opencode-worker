@@ -68,9 +68,30 @@ def validate_worktree(value):
     directory = Path(value).resolve(strict=True)
     if not directory.is_dir():
         raise ValueError('Worktree must be a directory')
-    for protected in (KEY.parent, STATE):
-        if protected.resolve().is_relative_to(directory):
+    protected_roots = tuple(path.resolve() for path in (KEY.parent, STATE))
+    for protected in protected_roots:
+        if protected.is_relative_to(directory):
             raise ValueError('Worktree must not contain the configured credential directory or worker state')
+    visited = set()
+    def traversal_error(error):
+        raise ValueError('Cannot validate worktree symlinks') from error
+    for root, directories, files in os.walk(directory, followlinks=True, onerror=traversal_error):
+        resolved_root = Path(root).resolve(strict=True)
+        if resolved_root in visited:
+            directories[:] = []
+            continue
+        visited.add(resolved_root)
+        for name in directories + files:
+            entry = Path(root) / name
+            if not entry.is_symlink():
+                continue
+            try:
+                target = entry.resolve()
+            except (OSError, RuntimeError) as error:
+                raise ValueError('Cannot validate worktree symlink') from error
+            if any(target.is_relative_to(protected) or protected.is_relative_to(target)
+                   for protected in protected_roots):
+                raise ValueError('Worktree symlink must not expose private credential or state directories')
     return directory
 
 
@@ -435,42 +456,53 @@ def execute(args):
         try:
             with (turn / 'events.jsonl').open('wb') as output, (turn / 'stderr.log').open('wb') as error:
                 env = environment(directory, settings, max_output_tokens=budget)
-                # Serialize the final check and launch against completed exhaustion writes.
-                with credit_lock():
-                    credit_preflight()
-                    meta.update(status='running', latest_turn=turn.name, started_at=time.time())
-                    save(directory / 'metadata.json', meta)
-                    try:
-                        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=error,
-                                                cwd=worktree, env=env, start_new_session=True)
-                    except OSError as launch_error:
-                        (turn / 'result.txt').write_text('')
-                        meta.update(status='failed', exit_code=1, finished_at=time.time(),
-                                    failure_reason='native_launch_failed', launch_error=type(launch_error).__name__)
-                        save(directory / 'metadata.json', meta)
-                        raise
+                proc = None
+                stop_requested = False
                 def terminate(_signum, _frame):
-                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                    raise KeyboardInterrupt()
+                    nonlocal stop_requested
+                    stop_requested = True
+                    if proc is not None and proc.returncode is None:
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                        raise KeyboardInterrupt()
                 signal.signal(signal.SIGTERM, terminate)
                 try:
+                    # Serialize the final check and launch against exhaustion writes.
+                    with credit_lock():
+                        credit_preflight()
+                        meta.update(status='running', latest_turn=turn.name, started_at=time.time())
+                        save(directory / 'metadata.json', meta)
+                        if stop_requested:
+                            raise KeyboardInterrupt()
+                        try:
+                            proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=error,
+                                                    cwd=worktree, env=env, start_new_session=True)
+                        except OSError as launch_error:
+                            (turn / 'result.txt').write_text('')
+                            meta.update(status='failed', exit_code=1, finished_at=time.time(),
+                                        failure_reason='native_launch_failed', launch_error=type(launch_error).__name__)
+                            save(directory / 'metadata.json', meta)
+                            raise
+                    if stop_requested:
+                        raise KeyboardInterrupt()
                     proc.communicate(task.encode(), timeout=timeout)
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     code = proc.returncode
                     status = 'complete' if code == 0 else 'failed'
                 except (subprocess.TimeoutExpired, KeyboardInterrupt):
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass  # The child group already exited; still reap and finalize.
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
+                    if proc is not None:
                         try:
-                            os.killpg(proc.pid, signal.SIGKILL)
+                            os.killpg(proc.pid, signal.SIGTERM)
                         except ProcessLookupError:
-                            pass  # Exit can race with escalation.
-                        proc.wait()
+                            pass  # The child group already exited; still reap and finalize.
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass  # Exit can race with escalation.
+                            proc.wait()
                     status, code = 'interrupted', 124
             meta['native_child_peak_rss_kib'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
             events = (turn / 'events.jsonl').read_text(errors='replace')
@@ -482,7 +514,7 @@ def execute(args):
                 meta['credit_exhaustion_reason'] = reason
                 print(f'api-worker: {reason}; shared API dispatch paused. Use native helpers until credits are verified available.', file=sys.stderr)
             result, session_id, errors = collect(events)
-            meta['native_exit_code'] = proc.returncode
+            meta['native_exit_code'] = proc.returncode if proc is not None else None
             if status != 'interrupted' and errors:
                 status, code = 'failed', 1
             elif status == 'complete':

@@ -17,6 +17,14 @@ def main(argv=None):
         parser.print_help()
         return 0
     command = argv[0]
+    if command in ('cancel', 'shutdown') and not any(value in ('-h', '--help') for value in argv[1:]):
+        routing = argparse.ArgumentParser(add_help=False)
+        routing.add_argument('run_id')
+        parsed, _ = routing.parse_known_args(argv[1:])
+        identifier = batch.run_id(parsed.run_id)
+        path = batch.STATE / identifier / 'metadata.json'
+        if path.is_file() and json.loads(path.read_text()).get('backend') != 'native-server':
+            raise ValueError('Stop commands are unsupported for legacy batch runs; no process was stopped')
     if command in ('start', 'send', 'wait', 'reply', 'cancel', 'shutdown'):
         return live.main(argv)
     if command == 'run' and ('--live' in argv or '--allow-commands' in argv):

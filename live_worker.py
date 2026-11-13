@@ -125,6 +125,8 @@ def client(directory):
 def configure_dispatch(directory, api, meta):
     """Restore request-specific acknowledgement context for owners and late-attaching observers."""
     message, turn = meta.get('current_request_id'), meta.get('latest_turn')
+    if message:
+        api.restore_idle_evidence(meta['session_id'], message, meta.get('current_result') or {})
     if not message or not turn:
         return
     receipt = json.loads((directory / turn / 'receipt.json').read_text())
@@ -160,9 +162,23 @@ def remember(directory, result):
         if not result.get('request_id') or result['request_id'] != meta.get('current_request_id'):
             return
         prior = meta.get('current_result') or {}
-        if (prior.get('status') in TERMINAL and result.get('status') not in TERMINAL
-                or (prior.get('observed_boot_id') and prior.get('observed_boot_id') == result.get('observed_boot_id')
-                    and prior.get('observed_at_ns', 0) > result.get('observed_at_ns', 0))):
+        if (prior.get('observed_boot_id') and prior.get('observed_boot_id') == result.get('observed_boot_id')
+                and prior.get('observed_at_ns', 0) > result.get('observed_at_ns', 0)):
+            return
+        if prior.get('status') in TERMINAL and result.get('status') not in TERMINAL:
+            if prior.get('incomplete_reason') == 'idle_unfinished_assistant':
+                # Keep the terminal receipt, but replace/invalidate stability evidence
+                # when a newer native observation shows changed output or activity.
+                prior = dict(prior)
+                prior.pop('idle_unfinished_evidence', None)
+                if result.get('idle_unfinished_evidence'):
+                    prior['idle_unfinished_evidence'] = result['idle_unfinished_evidence']
+                for field in ('observed_at_ns', 'observed_boot_id'):
+                    if field in result:
+                        prior[field] = result[field]
+                meta['current_result'] = prior
+                atomic(directory / meta['latest_turn'] / 'status.json', prior)
+                atomic(directory / 'metadata.json', meta)
             return
         if result.get('execution_observed'):
             confirm_dispatch(directory, meta, result['request_id'], 'native_execution')
@@ -481,9 +497,9 @@ def _send(directory, task, submission_id=None):
         api = client(directory)
         if meta.get('current_request_id'):
             current = api.snapshot(meta['session_id'], meta['current_request_id'])
+            remember(directory, current)
             if current['status'] not in TERMINAL or current.get('native_status') != 'idle':
                 raise ValueError('Prior request is still active; wait or cancel before a distinct submission')
-            remember(directory, current)
         turn = directory / ('turn-' + uuid.uuid4().hex)
         batch.private_dir(turn)
         (turn / 'task.txt').write_text(task)

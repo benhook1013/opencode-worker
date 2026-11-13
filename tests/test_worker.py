@@ -73,6 +73,29 @@ class LauncherTests(unittest.TestCase):
                     credential.assert_not_called()
                     launch.assert_not_called()
 
+    def test_worktree_links_reject_private_targets_and_allow_safe_cycles(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project, safe, credentials, state = [root / name for name in ('project', 'safe', 'credentials', 'state')]
+            for path in (project, safe, credentials, state): path.mkdir()
+            key = credentials / 'dummy'
+            key.write_text('dummy only')
+            (project / 'nested').mkdir()
+            with mock.patch.object(worker, 'KEY', key), mock.patch.object(worker, 'STATE', state):
+                for target in (key, credentials, state, root):
+                    link = project / 'nested/link'
+                    link.symlink_to(target)
+                    with self.assertRaisesRegex(ValueError, 'symlink must not expose'):
+                        worker.validate_worktree(project)
+                    link.unlink()
+                (project / 'external').symlink_to(safe, target_is_directory=True)
+                (safe / 'nested-secret').symlink_to(key)
+                with self.assertRaisesRegex(ValueError, 'symlink must not expose'):
+                    worker.validate_worktree(project)
+                (safe / 'nested-secret').unlink()
+                (safe / 'back').symlink_to(project, target_is_directory=True)
+                self.assertEqual(worker.validate_worktree(project), project)
+
     def test_native_event_result_collection(self):
         events = '\n'.join(['42', 'null', '[]', '{"type":"text","sessionID":"ses_fixture","part":{"text":"done"}}',
                             '{"type":"error","sessionID":"ses_fixture","error":{"name":"fixture"}}'])
@@ -403,6 +426,39 @@ class CreditGuardTests(unittest.TestCase):
                 saved = json.loads((artifact.parent / 'metadata.json').read_text())
                 self.assertEqual(saved['status'], 'interrupted')
                 self.assertTrue(artifact.joinpath('result.txt').exists())
+                self.assertEqual(worker.signal.getsignal(worker.signal.SIGTERM), previous)
+
+    def test_sigterm_before_launch_and_after_reap_preserves_finalization(self):
+        previous = worker.signal.getsignal(worker.signal.SIGTERM)
+        for phase in ('running-save', 'launch', 'reaped', 'final-save'):
+            with self.subTest(phase=phase):
+                process = mock.Mock(pid=12345, returncode=None)
+                original_save = worker.save
+                def save(path, value):
+                    if ((phase == 'running-save' and value.get('status') == 'running') or
+                            (phase == 'final-save' and value.get('status') == 'complete')):
+                        worker.signal.raise_signal(worker.signal.SIGTERM)
+                    return original_save(path, value)
+                def launch(*args, **kwargs):
+                    kwargs['stdout'].write('\n'.join(map(json.dumps, self.terminal_events())).encode())
+                    kwargs['stdout'].flush()
+                    if phase == 'launch': worker.signal.raise_signal(worker.signal.SIGTERM)
+                    return process
+                def communicate(*args, **kwargs):
+                    process.returncode = 0
+                    if phase == 'reaped': worker.signal.raise_signal(worker.signal.SIGTERM)
+                process.communicate.side_effect = communicate
+                process.wait.side_effect = lambda **kwargs: setattr(process, 'returncode', -15)
+                with mock.patch.object(worker, 'save', side_effect=save), \
+                        mock.patch.object(worker.subprocess, 'Popen', side_effect=launch) as launched, \
+                        mock.patch.object(worker.os, 'killpg'):
+                    code, meta = self.native_fixture('')
+                expected = 'interrupted' if phase in ('running-save', 'launch') else 'complete'
+                self.assertEqual(meta['status'], expected)
+                self.assertEqual(code, 124 if expected == 'interrupted' else 0)
+                if phase == 'running-save': launched.assert_not_called()
+                saved = json.loads((Path(meta['artifacts']).parent / 'metadata.json').read_text())
+                self.assertEqual(saved['status'], expected)
                 self.assertEqual(worker.signal.getsignal(worker.signal.SIGTERM), previous)
 
     def test_native_defaults_compaction_and_request_timeouts(self):

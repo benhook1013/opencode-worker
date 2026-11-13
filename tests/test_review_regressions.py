@@ -36,6 +36,21 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(cli_router.main(args), 0)
             route.assert_called_once_with(args)
 
+    def test_stop_commands_reject_legacy_batch_without_success(self):
+        live.update(self.directory, backend='batch', status='running')
+        for command in ('cancel', 'shutdown'):
+            with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(cli_router.live, 'main') as route:
+                with self.assertRaisesRegex(ValueError, 'unsupported for legacy batch'):
+                    cli_router.main([command, self.directory.name])
+                route.assert_not_called()
+            self.assertEqual(live.read(self.directory)['status'], 'running')
+
+    def test_stop_commands_route_managed_backends(self):
+        for command in ('cancel', 'shutdown'):
+            with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(cli_router.live, 'main', return_value=0) as route:
+                self.assertEqual(cli_router.main([command, self.directory.name]), 0)
+                route.assert_called_once_with([command, self.directory.name])
+
     def test_old_snapshot_cannot_replace_new_result(self):
         done = {'request_id': 'm', 'status': 'complete', 'text': 'done', 'observed_at_ns': 20, 'observed_boot_id': 'boot-one'}
         live.remember(self.directory, done)
@@ -291,7 +306,8 @@ class ReviewRegressions(unittest.TestCase):
     def test_batch_sigterm_stops_child_and_records_interruption(self):
         import signal
         args, key = self.batch_args()
-        process = mock.Mock(pid=999999, returncode=-15)
+        process = mock.Mock(pid=999999, returncode=None)
+        process.wait.side_effect = lambda **kwargs: setattr(process, 'returncode', -15)
         process.communicate.side_effect = lambda *a, **k: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
         with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(worker, 'KEY', key), mock.patch.object(worker.subprocess, 'Popen', return_value=process), mock.patch.object(worker.os, 'killpg') as kill, contextlib.redirect_stdout(__import__('io').StringIO()):
             with worker.credit_lock(): worker.credit_save(False, None)

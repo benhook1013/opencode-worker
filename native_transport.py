@@ -1,5 +1,6 @@
 """Thin authenticated loopback HTTP/SSE transport; OpenCode owns all agent execution."""
 import base64
+import hashlib
 import http.client
 import json
 from pathlib import Path
@@ -89,6 +90,23 @@ class NativeClient:
         self.dispatch_context = {}
         self.deadline = None
         self.idle_unfinished = {}
+        self.restored_idle_requests = set()
+
+    def restore_idle_evidence(self, session_id, message_id, result):
+        """Reuse request-specific stability only within the same boot clock epoch."""
+        key = (session_id, message_id)
+        if key in self.restored_idle_requests or key in self.idle_unfinished:
+            return
+        self.restored_idle_requests.add(key)
+        evidence = result.get('idle_unfinished_evidence') or {}
+        epoch = boot_id()
+        if (result.get('session_id') == session_id and result.get('request_id') == message_id
+                and result.get('native_status') == 'idle' and epoch
+                and evidence.get('boot_id') == epoch
+                and isinstance(evidence.get('signature'), str)
+                and isinstance(evidence.get('since'), (int, float))
+                and 0 <= evidence['since'] <= time.monotonic()):
+            self.idle_unfinished[(session_id, message_id)] = (evidence['signature'], evidence['since'])
 
     def note_dispatch(self, session_id, message_id, acknowledged_at, error=None):
         """Attach an acknowledgement and any observed session error to this exact request."""
@@ -218,12 +236,15 @@ class NativeClient:
         key = (session_id, message_id)
         if not info.get('time', {}).get('completed'):
             if native == 'idle':
-                signature = json.dumps(latest, sort_keys=True)
+                signature = hashlib.sha256(json.dumps(latest, sort_keys=True).encode()).hexdigest()
                 previous = self.idle_unfinished.get(key)
                 if previous is None or previous[0] != signature:
                     self.idle_unfinished[key] = (signature, time.monotonic())
                 elif time.monotonic() - previous[1] >= DISPATCH_GRACE_SECONDS:
                     result.update(status='incomplete', incomplete_reason='idle_unfinished_assistant')
+                result['idle_unfinished_evidence'] = {
+                    'signature': signature, 'since': self.idle_unfinished[key][1],
+                    'boot_id': result['observed_boot_id']}
             else:
                 self.idle_unfinished.pop(key, None)
             return result
