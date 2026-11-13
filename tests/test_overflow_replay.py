@@ -97,6 +97,21 @@ class OverflowReplayTests(unittest.TestCase):
                 if invalid == 'error':
                     self.assertEqual([m['info']['id'] for m in candidates], ['c'])
 
+    def test_snapshot_clock_follows_final_native_read(self):
+        client = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/fixture')
+        reads = []
+        def request(method, path):
+            reads.append(path)
+            return [] if path == '/question' else {}
+        def stamp():
+            self.assertEqual(reads, ['/question', '/session/status', '/question', '/session/status'])
+            return 42
+        with patch.object(client, 'messages_since', return_value=self.messages()), \
+                patch.object(client, 'request', side_effect=request), \
+                patch.object(transport.time, 'monotonic_ns', side_effect=stamp):
+            snapshot = client.snapshot('session', 'a')
+        self.assertEqual(snapshot['observed_at_ns'], 42)
+
     def test_unavailable_boot_identity_is_unknown(self):
         with patch.object(transport.Path, 'read_text', side_effect=OSError):
             self.assertIsNone(transport.boot_id())

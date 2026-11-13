@@ -312,6 +312,24 @@ class CreditGuardTests(unittest.TestCase):
         return [{'type': 'step_start'}, {'type': 'text', 'sessionID': 'ses_fixture', 'part': {'text': 'Fixture done'}},
                 {'type': 'step_finish', 'part': {'reason': 'stop'}}]
 
+    def test_batch_overflow_recovery_preserves_native_exit_code(self):
+        overflow = {'type': 'error', 'error': {'name': 'ContextOverflowError'}}
+        events = [overflow] + self.terminal_events()
+        code, meta = self.native_fixture('\n'.join(map(json.dumps, events)), native_code=1)
+        self.assertEqual((code, meta['status'], meta['native_exit_code']), (0, 'complete', 1))
+        self.assertTrue(meta['recovered_context_overflow'])
+
+    def test_batch_overflow_does_not_hide_terminal_failures(self):
+        overflow = {'type': 'error', 'error': {'name': 'ContextOverflowError'}}
+        for events in ([overflow], self.terminal_events() + [overflow],
+                       [overflow] + self.terminal_events() + [{'type': 'error', 'error': {'name': 'APIError'}}],
+                       [overflow, {'type': 'step_start'}, {'type': 'step_finish', 'part': {'reason': 'length'}}]):
+            with self.subTest(events=events):
+                code, meta = self.native_fixture('\n'.join(map(json.dumps, events)), native_code=1)
+                self.assertEqual((code, meta['status'], meta['native_exit_code']), (1, 'failed', 1))
+        code, meta = self.native_fixture('\n'.join(map(json.dumps, [overflow] + self.terminal_events())), native_code=2)
+        self.assertEqual((code, meta['status']), (1, 'failed'))
+
     def test_output_budget_config_bounds_and_legacy_default(self):
         args = argparse.Namespace(max_output_tokens=None)
         limits = worker.model_limits('openai/gpt-6-luna')

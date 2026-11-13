@@ -195,7 +195,6 @@ class NativeClient:
             path = f'/session/{session_id}/message?limit=100&before=' + urllib.parse.quote(cursor, safe='')
 
     def snapshot(self, session_id, message_id):
-        observed_at_ns = time.monotonic_ns()
         messages = self.messages_since(session_id, message_id)
         questions = self.questions(session_id)
         native = self.request('GET', '/session/status').get(session_id, {'type': 'idle'})['type']
@@ -205,6 +204,7 @@ class NativeClient:
             messages = self.messages_since(session_id, message_id)
             questions = self.questions(session_id)
             native = self.request('GET', '/session/status').get(session_id, {'type': 'idle'})['type']
+        observed_at_ns = time.monotonic_ns()
         candidates = request_assistants(messages, message_id)
         result = {'session_id': session_id, 'request_id': message_id, 'status': 'running' if native != 'idle' else 'queued',
                   'native_status': native, 'text': '', 'questions': questions, 'observed_at_ns': observed_at_ns, 'observed_boot_id': boot_id(),

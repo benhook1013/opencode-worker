@@ -406,6 +406,26 @@ def incomplete_reason(events):
     return None
 
 
+def recovered_overflow(events):
+    """Accept only known overflow diagnostics followed by a successful native step."""
+    overflow, later_step = False, False
+    for line in events.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get('type') == 'error':
+            error = event.get('error')
+            if not isinstance(error, dict) or error.get('name') != 'ContextOverflowError':
+                return False
+            overflow, later_step = True, False
+        elif event.get('type') == 'step_start' and overflow:
+            later_step = True
+    return overflow and later_step and incomplete_reason(events) is None
+
+
 def execute(args):
     with credit_lock():
         credit_preflight()
@@ -442,6 +462,7 @@ def execute(args):
         long_context = getattr(args, 'long_context', None)
         meta['long_context'] = meta.get('long_context', False) if long_context is None else long_context
         meta.pop('incomplete_reason', None)
+        meta.pop('recovered_context_overflow', None)
         task = Path(args.task_file).read_text()
         if not task.strip():
             raise ValueError('Task file is empty')
@@ -519,7 +540,10 @@ def execute(args):
                 print(f'api-worker: {reason}; shared API dispatch paused. Use native helpers until credits are verified available.', file=sys.stderr)
             result, session_id, errors = collect(events)
             meta['native_exit_code'] = proc.returncode if proc is not None else None
-            if status != 'interrupted' and errors:
+            if status != 'interrupted' and code in (0, 1) and recovered_overflow(events):
+                status, code = 'complete', 0
+                meta['recovered_context_overflow'] = True
+            elif status != 'interrupted' and errors:
                 status, code = 'failed', 1
             elif status == 'complete':
                 incomplete = incomplete_reason(events)
