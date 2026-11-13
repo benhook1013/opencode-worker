@@ -312,6 +312,38 @@ class CreditGuardTests(unittest.TestCase):
         return [{'type': 'step_start'}, {'type': 'text', 'sessionID': 'ses_fixture', 'part': {'text': 'Fixture done'}},
                 {'type': 'step_finish', 'part': {'reason': 'stop'}}]
 
+    def test_credit_latch_failures_finalize_result_and_session_before_raising(self):
+        for failure in ('state', 'save'):
+            with self.subTest(failure=failure):
+                state, save = worker.credit_state, worker.credit_save
+                calls = 0
+                def read_state():
+                    nonlocal calls
+                    calls += 1
+                    if failure == 'state' and calls == 3:
+                        raise ValueError('fixture malformed guard')
+                    return state()
+                def save_state(exhausted, reason):
+                    if failure == 'save' and exhausted:
+                        raise OSError('fixture persistence failure')
+                    return save(exhausted, reason)
+                events = self.terminal_events() + [json.loads(self.error('insufficient_quota'))]
+                before = set(self.state.glob('*/metadata.json'))
+                with mock.patch.object(worker, 'credit_state', side_effect=read_state), \
+                        mock.patch.object(worker, 'credit_save', side_effect=save_state):
+                    with self.assertRaises((ValueError, OSError)):
+                        self.native_fixture('\n'.join(map(json.dumps, events)), native_code=1)
+                paths = set(self.state.glob('*/metadata.json')) - before
+                self.assertEqual(len(paths), 1)
+                path = paths.pop()
+                meta = json.loads(path.read_text())
+                self.assertEqual((meta['status'], meta['exit_code']), ('failed', 1))
+                self.assertEqual(meta['session_id'], 'ses_fixture')
+                self.assertEqual(meta['credit_exhaustion_reason'], 'insufficient_quota')
+                self.assertEqual(meta['credit_latch_error'], 'ValueError' if failure == 'state' else 'OSError')
+                self.assertIn('finished_at', meta)
+                self.assertEqual((path.parent / meta['latest_turn'] / 'result.txt').read_text(), 'Fixture done')
+
     def test_batch_overflow_recovery_preserves_native_exit_code(self):
         overflow = {'type': 'error', 'error': {'name': 'ContextOverflowError'}}
         events = [overflow] + self.terminal_events()

@@ -463,6 +463,7 @@ def execute(args):
         meta['long_context'] = meta.get('long_context', False) if long_context is None else long_context
         meta.pop('incomplete_reason', None)
         meta.pop('recovered_context_overflow', None)
+        meta.pop('credit_latch_error', None)
         task = Path(args.task_file).read_text()
         if not task.strip():
             raise ValueError('Task file is empty')
@@ -532,12 +533,20 @@ def execute(args):
             meta['native_child_peak_rss_kib'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
             events = (turn / 'events.jsonl').read_text(errors='replace')
             reason = exhaustion_reason(events)
+            latch_error = None
             if reason:
-                with credit_lock():
-                    credit_state()  # Unexpected corruption stays closed until explicit owner reset.
-                    credit_save(True, reason)
+                try:
+                    with credit_lock():
+                        credit_state()  # Unexpected corruption stays closed until explicit owner reset.
+                        credit_save(True, reason)
+                except (OSError, ValueError) as error:
+                    latch_error = error
+                    meta['credit_latch_error'] = type(error).__name__
                 meta['credit_exhaustion_reason'] = reason
-                print(f'api-worker: {reason}; shared API dispatch paused. Use native helpers until credits are verified available.', file=sys.stderr)
+                if latch_error is None:
+                    print(f'api-worker: {reason}; shared API dispatch paused. Use native helpers until credits are verified available.', file=sys.stderr)
+                else:
+                    print(f'api-worker: {reason}; credit latch persistence failed. Do not dispatch more API work until the guard is repaired and credits verified.', file=sys.stderr)
             result, session_id, errors = collect(events)
             meta['native_exit_code'] = proc.returncode if proc is not None else None
             if status != 'interrupted' and code in (0, 1) and recovered_overflow(events):
@@ -557,6 +566,8 @@ def execute(args):
             meta.update(status=status, exit_code=code, finished_at=time.time())
             save(directory / 'metadata.json', meta)
             print(json.dumps({**meta, 'artifacts': str(turn)}))
+            if latch_error is not None:
+                raise latch_error
             return code
         finally:
             signal.signal(signal.SIGTERM, previous_sigterm)
