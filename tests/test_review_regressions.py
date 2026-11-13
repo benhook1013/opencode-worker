@@ -79,6 +79,26 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(live.send(self.directory, 'task', 'key', controls=object()), 'accepted')
             self.assertEqual(live.send(self.directory, 'task', 'key'), 'accepted')
 
+    def test_duplicate_with_controls_returns_receipt_without_changing_backend(self):
+        import hashlib
+        live.atomic(self.turn / 'receipt.json', {'submission_id': 'same',
+            'task_sha256': hashlib.sha256(b'task').hexdigest(), 'request_id': 'm',
+            'stage_status': 'staged', 'dispatch_status': 'confirmed'})
+        with mock.patch.object(live, 'configure_idle') as configure, mock.patch.object(live, '_send') as send:
+            result = live.send(self.directory, 'task', 'same', controls=object())
+        self.assertTrue(result['already_submitted'])
+        configure.assert_not_called()
+        send.assert_not_called()
+
+    def test_uncertain_duplicate_with_controls_does_not_change_backend(self):
+        import hashlib
+        live.atomic(self.turn / 'receipt.json', {'submission_id': 'same',
+            'task_sha256': hashlib.sha256(b'task').hexdigest(), 'stage_status': 'pending'})
+        with mock.patch.object(live, 'configure_idle') as configure:
+            with self.assertRaisesRegex(ValueError, 'uncertain native staging'):
+                live.send(self.directory, 'task', 'same', controls=object())
+        configure.assert_not_called()
+
     def test_stopped_without_cached_result_keeps_failure_identity(self):
         live.update(self.directory, server_lifecycle='stopped', current_result=None)
         result = live.status(self.directory)

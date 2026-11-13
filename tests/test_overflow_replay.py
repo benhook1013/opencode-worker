@@ -65,6 +65,38 @@ class OverflowReplayTests(unittest.TestCase):
         self.assertEqual(snapshot['text'], 'Recovered answer')
         self.assertEqual(snapshot['observed_boot_id'], 'fixture-boot')
 
+    def test_length_limited_summary_allows_owned_continuation_snapshot(self):
+        for overflow in (False, True):
+            with self.subTest(overflow=overflow):
+                messages = self.messages(overflow=overflow)
+                messages[2]['info']['finish'] = 'length'
+                if not overflow:
+                    messages[3]['parts'] = [{'type': 'text', 'synthetic': True,
+                                             'metadata': {'compaction_continue': True}}]
+                client = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/fixture')
+                with patch.object(client, 'messages_since', return_value=messages), \
+                        patch.object(client, 'request', side_effect=[[], {}, [], {}]):
+                    snapshot = client.snapshot('session', 'a')
+                self.assertEqual(snapshot['status'], 'complete')
+                self.assertEqual(snapshot['text'], 'Recovered answer')
+
+    def test_length_limited_summary_retains_completion_and_ancestry_guards(self):
+        for invalid in ('error', 'incomplete', 'unrelated'):
+            with self.subTest(invalid=invalid):
+                messages = self.messages()
+                summary = messages[2]['info']
+                summary['finish'] = 'length'
+                if invalid == 'error':
+                    summary['error'] = {'name': 'APIError', 'data': {'message': 'failure'}}
+                elif invalid == 'incomplete':
+                    summary['time'].pop('completed')
+                else:
+                    summary['parentID'] = 'unrelated'
+                candidates = transport.request_assistants(messages, 'a')
+                self.assertNotIn('e', [m['info']['id'] for m in candidates])
+                if invalid == 'error':
+                    self.assertEqual([m['info']['id'] for m in candidates], ['c'])
+
     def test_unavailable_boot_identity_is_unknown(self):
         with patch.object(transport.Path, 'read_text', side_effect=OSError):
             self.assertIsNone(transport.boot_id())

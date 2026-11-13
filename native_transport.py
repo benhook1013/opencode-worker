@@ -69,7 +69,7 @@ def request_assistants(messages, message_id):
                 if info.get('parentID') in compactions:
                     if info.get('error'):
                         candidates.append(message)  # Owned compaction failure, never a final answer.
-                    elif info.get('finish') == 'stop' and info.get('time', {}).get('completed'):
+                    elif info.get('finish') in {'stop', 'length'} and info.get('time', {}).get('completed'):
                         completed_compactions.add(info['parentID'])
                 continue  # A compaction summary is not the delegated task's final answer.
             if info.get('parentID') in parents:

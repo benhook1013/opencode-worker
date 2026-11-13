@@ -438,6 +438,13 @@ def require_known_dispatch(directory):
 def send(directory, task, submission_id=None, controls=None):
     # All entry points serialize controls and admission before acquiring existing locks.
     with locked(directory / 'submission.lock'):
+        if not task.strip():
+            raise ValueError('Task file is empty')
+        require_known_dispatch(directory)
+        fingerprint = hashlib.sha256(task.encode()).hexdigest()
+        prior = prior_submission(directory, submission_id or fingerprint, fingerprint)
+        if prior:
+            return prior
         if controls is not None:
             configure_idle(directory, controls)
         return _send(directory, task, submission_id)
