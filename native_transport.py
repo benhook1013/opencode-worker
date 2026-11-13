@@ -313,6 +313,15 @@ class NativeClient:
             self.deadline = old_deadline
 
 
+def compaction_reserved(limits):
+    """Keep the 250k trigger while scaling headroom for smaller model windows."""
+    context = limits['context']
+    # Native 1.19.5 subtracts reserved from limit.input and compares total tokens.
+    # Never let fixed headroom consume a small context window.
+    headroom = min(32000, limits['output'], context // 4)
+    return context - min(250000, context - headroom)
+
+
 def live_settings(settings, *, allow_commands=False, long_context=False, shell_plugin=None):
     settings = json.loads(json.dumps(settings))
     settings['permission']['question'] = 'allow'
@@ -329,6 +338,5 @@ def live_settings(settings, *, allow_commands=False, long_context=False, shell_p
     if long_context:
         settings['compaction'].pop('reserved', None)
     else:
-        threshold = min(250000, max(1, limits['context'] - 32000))
-        settings['compaction']['reserved'] = limits['input'] - threshold
+        settings['compaction']['reserved'] = compaction_reserved(limits)
     return settings

@@ -137,3 +137,48 @@ class InstallTests(unittest.TestCase):
                     with mock.patch.object(installer, 'SOURCE', source):
                         installer.install(prefix)  # A failed install must not poison a retry.
                     self.assertTrue(launcher.exists())
+
+
+    def test_interrupt_rolls_back_partial_install_and_preserves_interrupt(self):
+        spec = importlib.util.spec_from_file_location('interrupt_installer', ROOT / 'install.py')
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        for phase in ('copy', 'move', 'launcher'):
+            for cleanup_fails in (False, True):
+                with self.subTest(phase=phase, cleanup_fails=cleanup_fails), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    source = root / 'source'
+                    for name in (*installer.MODULES, 'README.md', 'LICENSE', 'bin/api-worker',
+                                 'runtime/node_modules/opencode-linux-x64/bin/opencode'):
+                        path = source / name
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text('fixture')
+                    prefix = root / 'prefix'
+                    interruption = KeyboardInterrupt('fixture cancellation')
+                    if phase == 'copy':
+                        operation = mock.patch.object(installer.shutil, 'copytree', side_effect=interruption)
+                    elif phase == 'move':
+                        operation = mock.patch.object(Path, 'rename', side_effect=interruption)
+                    else:
+                        operation = mock.patch.object(installer.os, 'fchmod', side_effect=interruption)
+                    real_remove = installer.remove_tree
+                    attempted = []
+
+                    def cleanup(path):
+                        attempted.append(path)
+                        real_remove(path)
+                        if cleanup_fails:
+                            raise OSError('fixture rollback failure')
+
+                    with mock.patch.object(installer, 'SOURCE', source), operation, \
+                            mock.patch.object(installer, 'remove_tree', side_effect=cleanup), \
+                            self.assertRaises(KeyboardInterrupt) as raised:
+                        installer.install(prefix)
+                    self.assertIs(raised.exception, interruption)
+                    self.assertFalse((prefix / 'bin/api-worker').exists())
+                    self.assertFalse((prefix / 'share/api-worker').exists())
+                    self.assertEqual(list((prefix / 'share').iterdir()), [])
+                    self.assertEqual(len(attempted), 1 if phase == 'copy' else 2)
+                    with mock.patch.object(installer, 'SOURCE', source):
+                        installer.install(prefix)
+                    self.assertTrue((prefix / 'bin/api-worker').exists())

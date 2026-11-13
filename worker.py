@@ -17,6 +17,8 @@ import time
 import tempfile
 import uuid
 
+from native_transport import compaction_reserved
+
 REASONING_CHOICES = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh')
 
 ROOT = Path(__file__).resolve().parent
@@ -84,7 +86,7 @@ def config(model, reasoning, writable, steps=None, key=KEY, worktree=None, limit
     native_limits = {**limits, 'input': limits['context']}
     compaction = {'auto': True}
     if not long_context:
-        compaction['reserved'] = limits['context'] - min(250000, max(1, limits['context'] - 32000))
+        compaction['reserved'] = compaction_reserved(limits)
     permission = {'*': 'deny', 'read': 'allow', 'glob': 'allow', 'grep': 'allow',
                   'external_directory': 'deny', 'edit': 'allow' if writable else 'deny'}
     return {

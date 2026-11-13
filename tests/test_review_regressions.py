@@ -79,6 +79,36 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(live.send(self.directory, 'task', 'key', controls=object()), 'accepted')
             self.assertEqual(live.send(self.directory, 'task', 'key'), 'accepted')
 
+    def test_stopped_without_cached_result_keeps_failure_identity(self):
+        live.update(self.directory, server_lifecycle='stopped', current_result=None)
+        result = live.status(self.directory)
+        self.assertEqual(result['request_id'], 'm')
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['failure_reason'], 'backend_stopped_without_terminal_receipt')
+
+    def test_recovery_snapshot_reaps_only_confirmed_terminal_idle(self):
+        live.update(self.directory, idle_reap_seconds=1)
+        api, stopping = mock.Mock(), threading.Event()
+        result = {'request_id': 'm', 'status': 'complete', 'native_status': 'idle', 'text': 'done'}
+        api.snapshot.return_value = result
+        with mock.patch.object(live.time, 'monotonic', return_value=10):
+            since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), result, None, stopping)
+        self.assertEqual(since, 10)
+        self.assertFalse(stopping.is_set())
+        with mock.patch.object(live.time, 'monotonic', return_value=12):
+            live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), result, since, stopping)
+        self.assertTrue(stopping.is_set())
+        self.assertTrue(live.read(self.directory)['stop_requested'])
+
+    def test_recovery_snapshot_does_not_reap_active_work(self):
+        live.update(self.directory, idle_reap_seconds=1)
+        api, stopping = mock.Mock(), threading.Event()
+        result = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
+        since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), result, 1, stopping)
+        self.assertIsNone(since)
+        self.assertFalse(stopping.is_set())
+        api.snapshot.assert_not_called()
+
     def test_old_wait_cursor_is_superseded_before_observation(self):
         with mock.patch.object(live, 'status') as status:
             result = live.wait(self.directory, 'older')

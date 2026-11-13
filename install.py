@@ -50,7 +50,7 @@ def install(prefix):
             target.write((SOURCE / 'bin/api-worker').read_text())
             target.flush()
             os.fchmod(target.fileno(), 0o700)
-    except Exception as original:
+    except BaseException as original:
         cleanup_errors = []
         if created_launcher is not None:
             try:
@@ -66,6 +66,11 @@ def install(prefix):
                 remove_tree(path)
             except OSError as error:
                 cleanup_errors.append(str(error))
+        if cleanup_errors and not isinstance(original, Exception):
+            # Keep cancellation/exit semantics even when rollback itself fails.
+            if hasattr(original, 'add_note'):
+                original.add_note('Rollback also failed: ' + '; '.join(cleanup_errors))
+            raise
         if cleanup_errors:
             raise OSError(f'{original}; rollback also failed: ' + '; '.join(cleanup_errors)) from original
         raise

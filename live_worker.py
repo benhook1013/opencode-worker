@@ -275,19 +275,7 @@ def run_server(directory):
                             configure_dispatch(directory, api, meta)
                             result = api.snapshot(session, message) if message else None
                             last_snapshot = time.monotonic()
-                            if result:
-                                remember(directory, result)
-                            terminal = result is None or result['status'] in TERMINAL
-                            idle = terminal and (result is None or result['native_status'] == 'idle')
-                            idle_since = (idle_since or time.monotonic()) if idle else None
-                            enforce_timeout(directory, api, session, stopping=stopping)
-                            if idle_since is not None and time.monotonic() - idle_since >= (meta.get('idle_reap_seconds', 30) if message else 30):
-                                with locked(directory / 'control.lock', stopping=stopping):
-                                    latest = read(directory)
-                                    if latest.get('current_request_id') == message and (not message or api.snapshot(session, message)['status'] in TERMINAL):
-                                        update(directory, stop_requested=True)
-                                        stopping.set()
-                                        break
+                            idle_since = reconcile_owner_snapshot(directory, api, session, meta, result, idle_since, stopping)
                             if stopping.is_set():
                                 break
                     except (OSError, ValueError):
@@ -298,9 +286,10 @@ def run_server(directory):
                         try:
                             enforce_timeout(directory, api, session, stopping=stopping)
                             latest = read(directory)
-                            if latest.get('current_request_id'):
-                                configure_dispatch(directory, api, latest)
-                                remember(directory, api.snapshot(session, latest['current_request_id']))
+                            message = latest.get('current_request_id')
+                            configure_dispatch(directory, api, latest)
+                            result = api.snapshot(session, message) if message else None
+                            idle_since = reconcile_owner_snapshot(directory, api, session, latest, result, idle_since, stopping)
                         except (OSError, ValueError):
                             pass  # Observation failure must not terminate healthy native work.
                         time.sleep(0.2)
@@ -317,6 +306,29 @@ def run_server(directory):
                     process.wait()
                 update(directory, native_server_lifetime_peak_rss_kib=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
             update(directory, server_lifecycle='stopped', owner_pid=None, native_server_pid=None)
+
+
+def reconcile_owner_snapshot(directory, api, session, meta, result, idle_since, stopping):
+    """Apply successful observations identically for event and recovery paths."""
+    message = meta.get('current_request_id')
+    if result:
+        remember(directory, result)
+    idle = (api.request('GET', '/session/status').get(session, {'type': 'idle'})['type'] == 'idle'
+            if result is None else result['status'] in TERMINAL and result.get('native_status') == 'idle')
+    now = time.monotonic()
+    idle_since = (now if idle_since is None else idle_since) if idle else None
+    enforce_timeout(directory, api, session, stopping=stopping)
+    if idle_since is not None and now - idle_since >= (meta.get('idle_reap_seconds', 30) if message else 30):
+        with locked(directory / 'control.lock', stopping=stopping):
+            latest = read(directory)
+            if latest.get('current_request_id') == message:
+                confirmed = api.snapshot(session, message) if message else None
+                confirmed_idle = (api.request('GET', '/session/status').get(session, {'type': 'idle'})['type'] == 'idle'
+                                  if confirmed is None else confirmed['status'] in TERMINAL and confirmed.get('native_status') == 'idle')
+                if confirmed_idle:
+                    update(directory, stop_requested=True)
+                    stopping.set()
+    return idle_since
 
 
 def owner_events(api, stopping, interval=1):
@@ -521,7 +533,7 @@ def status(directory):
                     raise ValueError('Native transport unavailable; inspect partial state before an explicit follow-up')
                 result = result or {}
     else:
-        result = meta.get('current_result') or {}
+        result = meta.get('current_result') or {'request_id': meta['current_request_id']}
         if result.get('execution_observed') and result.get('request_id') == meta.get('current_request_id'):
             remember(directory, result)
         if result.get('status') not in TERMINAL:
