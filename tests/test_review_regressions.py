@@ -251,6 +251,30 @@ class ReviewRegressions(unittest.TestCase):
         self.assertTrue(stopping.is_set())
         self.assertTrue(live.read(self.directory)['stop_requested'])
 
+    def test_protected_activity_restarts_idle_interval_for_same_request(self):
+        live.update(self.directory, idle_reap_seconds=30)
+        api, stopping = mock.Mock(), threading.Event()
+        idle = {'request_id': 'm', 'status': 'complete', 'native_status': 'idle'}
+        busy = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
+        api.snapshot.return_value = busy
+        with mock.patch.object(live.time, 'monotonic', return_value=10):
+            since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), idle, None, stopping)
+        with mock.patch.object(live.time, 'monotonic', return_value=40):
+            since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), idle, since, stopping)
+        self.assertIsNone(since)
+        self.assertFalse(stopping.is_set())
+        api.snapshot.return_value = idle
+        with mock.patch.object(live.time, 'monotonic', return_value=41):
+            since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), idle, since, stopping)
+        self.assertEqual(since, ('m', 41))
+        self.assertFalse(stopping.is_set())
+        with mock.patch.object(live.time, 'monotonic', return_value=70):
+            since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), idle, since, stopping)
+        self.assertFalse(stopping.is_set())
+        with mock.patch.object(live.time, 'monotonic', return_value=71):
+            live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), idle, since, stopping)
+        self.assertTrue(stopping.is_set())
+
     def test_reaper_retains_final_protected_snapshot_before_stop(self):
         live.update(self.directory, idle_reap_seconds=1)
         provisional = {'request_id': 'm', 'status': 'incomplete', 'native_status': 'idle',

@@ -377,6 +377,8 @@ def reconcile_owner_snapshot(directory, api, session, meta, result, idle_since, 
                         remember(directory, confirmed)
                     update(directory, stop_requested=True)
                     stopping.set()
+                else:
+                    idle_since = None
     return idle_since
 
 
