@@ -319,12 +319,16 @@ class NativeClient:
                                 observer(result)
                             return result
                     raise ConnectionError('Native event stream closed')
-                except (ConnectionError, socket.timeout, urllib.error.URLError):
+                except (ConnectionError, socket.timeout, urllib.error.URLError) as error:
+                    if isinstance(error, urllib.error.HTTPError) and not (500 <= error.code < 600 or error.code in (408, 429)):
+                        raise
                     if self.deadline is not None and time.monotonic() >= self.deadline:
                         return {**result, 'wait_timed_out': True}
                     try:
                         result = self.snapshot(session_id, message_id)
-                    except (ConnectionError, socket.timeout, urllib.error.URLError):
+                    except (ConnectionError, socket.timeout, urllib.error.URLError) as error:
+                        if isinstance(error, urllib.error.HTTPError) and not (500 <= error.code < 600 or error.code in (408, 429)):
+                            raise
                         pass  # Preserve the last observation and retry within the deadline.
                     else:
                         if observer:

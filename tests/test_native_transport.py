@@ -617,6 +617,36 @@ class DispatchOutcomeTests(unittest.TestCase):
 
 
 class EventReconciliationTests(unittest.TestCase):
+    def test_wait_rejects_permanent_http_errors_in_both_handlers(self):
+        for code in (301, 400, 401, 403, 404, 422):
+            for fallback in (False, True):
+                with self.subTest(code=code, fallback=fallback):
+                    client = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
+                    error = transport.urllib.error.HTTPError('fixture', code, 'permanent', {}, None)
+                    client.deadline = 123
+                    with mock.patch.object(client, 'events', side_effect=ConnectionError() if fallback else error), \
+                         mock.patch.object(client, 'snapshot', side_effect=error) as snapshot, \
+                         mock.patch.object(transport.time, 'sleep') as sleep:
+                        with self.assertRaises(transport.urllib.error.HTTPError) as caught:
+                            client.wait('session', 'request')
+                        self.assertIs(caught.exception, error)
+                        self.assertEqual(client.deadline, 123)
+                        self.assertEqual(snapshot.call_count, int(fallback))
+                        sleep.assert_not_called()
+
+    def test_wait_retries_transient_http_errors_in_both_handlers(self):
+        for code in (408, 429, 500, 503, 599):
+            with self.subTest(code=code):
+                client = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
+                error = transport.urllib.error.HTTPError('fixture', code, 'transient', {}, None)
+                terminal = {'status': 'complete'}
+                with mock.patch.object(client, 'events', side_effect=error), \
+                     mock.patch.object(client, 'snapshot', side_effect=[error, terminal]) as snapshot, \
+                     mock.patch.object(transport.time, 'sleep') as sleep:
+                    self.assertEqual(client.wait('session', 'request'), terminal)
+                    self.assertEqual(snapshot.call_count, 2)
+                    sleep.assert_called_once()
+
     def test_truncated_event_stream_preserves_cause_and_wait_recovers(self):
         """Normalize truncated HTTP streams and reconcile retained terminal state."""
         client = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
