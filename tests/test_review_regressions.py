@@ -65,6 +65,17 @@ class ReviewRegressions(unittest.TestCase):
             with worker.credit_lock(): worker.credit_save(False, None)
             with self.assertRaises(OSError): worker.execute(args)
 
+    def test_managed_result_is_durable_before_terminal_metadata(self):
+        events = []
+        atomic = live.atomic
+        def tracked(path, value):
+            if path.name == 'metadata.json':
+                events.append('metadata')
+            return atomic(path, value)
+        with mock.patch.object(live.batch, 'durable_text', side_effect=lambda path, text: events.append('durable-result')), mock.patch.object(live, 'atomic', side_effect=tracked):
+            live.remember(self.directory, {'request_id': 'm', 'status': 'complete', 'text': 'done'})
+        self.assertEqual(events, ['durable-result', 'metadata'])
+
     def test_option_first_resume_routes_to_managed(self):
         with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(cli_router.live, 'main', return_value=0) as route:
             args = ['resume', '--task-file', 'task.txt', self.directory.name]

@@ -994,6 +994,14 @@ class LiveBoundaryTests(unittest.TestCase):
             live.update(directory, current_request_id='native-accepted')
             live.start(args)
             self.assertEqual(send.call_count, 2)
+            live.update(directory, status='complete', current_result={'status': 'complete'})
+            args.submission_id = None
+            live.start(args)
+            self.assertEqual(send.call_args.args[2], 'initial')
+            args.submission_id = 'different'
+            with self.assertRaisesRegex(ValueError, 'differs from the initial'): live.start(args)
+            self.assertEqual(send.call_count, 3)
+            args.submission_id = 'initial'
             args.worktree = str(second)
             with self.assertRaisesRegex(ValueError, 'different initial assignment'): live.start(args)
             args.worktree = str(first)

@@ -186,7 +186,7 @@ def remember(directory, result):
             confirm_dispatch(directory, meta, result['request_id'], 'native_execution')
         turn = directory / meta['latest_turn']
         atomic(turn / 'status.json', result)
-        (turn / 'result.txt').write_text(result.get('text', ''))
+        batch.durable_text(turn / 'result.txt', result.get('text', ''))
         meta.update(status=result['status'], current_result=result)
         atomic(directory / 'metadata.json', meta)
     if result.get('error'):
@@ -695,11 +695,13 @@ def start(args):
         previous = read(directory)
         if previous.get('backend') != 'native-server' or previous.get('start_spec_sha256') != spec:
             raise ValueError('Worker ID already exists with a different initial assignment; nothing was replayed')
+        initial_id = previous.get('initial_submission_id')
+        if not initial_id:
+            raise ValueError('Initial submission identity is unavailable; inspect retained receipts. Nothing was replayed.')
+        if args.submission_id is not None and args.submission_id != initial_id:
+            raise ValueError('Submission ID differs from the initial assignment; nothing was replayed')
         require_known_dispatch(directory)
-        previous = read(directory)
-        if not previous.get('current_request_id'):
-            return send(directory, task, args.submission_id)
-        return send(directory, task, args.submission_id)
+        return send(directory, task, initial_id)
     batch.private_dir(directory)
     # Older wait commands could leave a control lock before initialization.
     for entry in directory.iterdir():
@@ -725,13 +727,14 @@ def start(args):
         password_file.write(secrets.token_urlsafe(32))
         password_file.flush()
         os.fsync(password_file.fileno())
-    atomic(directory / 'metadata.json', {'backend': 'native-server', 'start_spec_sha256': spec, 'settings_sha256': settings_digest(settings), 'status': 'starting', 'run_id': directory.name, 'worktree': worktree,
+    initial_id = args.submission_id or hashlib.sha256(task.encode()).hexdigest()
+    atomic(directory / 'metadata.json', {'backend': 'native-server', 'initial_submission_id': initial_id, 'start_spec_sha256': spec, 'settings_sha256': settings_digest(settings), 'status': 'starting', 'run_id': directory.name, 'worktree': worktree,
         'model': model, 'reasoning': args.reasoning, 'model_limits': limits, 'model_limits_explicit': bool(args.context_window or args.model_output_limit),
         'allow_write': args.allow_write, 'allow_commands': args.allow_commands, 'long_context': args.long_context,
         'steps': steps, 'steps_explicit': steps is not None, 'output_override': budget, 'output_limit_explicit': budget is not None,
         'max_output_tokens': budget or min(32000, limits['output']), 'timeout_seconds': args.timeout or None,
         'command_environment': command_env, 'idle_reap_seconds': 30, 'server_lifecycle': 'new'})
-    return send(directory, task, args.submission_id)
+    return send(directory, task, initial_id)
 
 
 
