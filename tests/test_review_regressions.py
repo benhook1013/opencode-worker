@@ -209,6 +209,48 @@ class ReviewRegressions(unittest.TestCase):
         self.assertTrue(stopping.is_set())
         self.assertTrue(live.read(self.directory)['stop_requested'])
 
+    def test_reaper_retains_final_protected_snapshot_before_stop(self):
+        live.update(self.directory, idle_reap_seconds=1)
+        provisional = {'request_id': 'm', 'status': 'incomplete', 'native_status': 'idle',
+                       'incomplete_reason': 'idle_unfinished_assistant', 'text': 'partial'}
+        final = {'request_id': 'm', 'status': 'complete', 'native_status': 'idle', 'text': 'final answer'}
+        api, stopping = mock.Mock(), threading.Event()
+        api.snapshot.return_value = final
+        with mock.patch.object(live.time, 'monotonic', return_value=12):
+            live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), provisional, 10, stopping)
+        self.assertTrue(stopping.is_set())
+        self.assertEqual(live.read(self.directory)['current_result'], final)
+        self.assertEqual((self.turn / 'result.txt').read_text(), 'final answer')
+        live.update(self.directory, server_lifecycle='stopped')
+        self.assertEqual(live.status(self.directory)['text'], 'final answer')
+        self.assertEqual(live.wait(self.directory)['text'], 'final answer')
+
+    def test_controls_validate_before_stopping_idle_backend(self):
+        from argparse import Namespace
+        args = Namespace(timeout=-1, max_steps=None, max_output_tokens=None,
+                         context_window=None, model_output_limit=None, long_context=None)
+        with mock.patch.object(live, 'client') as client, mock.patch.object(live, 'signal_owned') as stop:
+            with self.assertRaisesRegex(ValueError, 'Timeout must be positive'):
+                live.configure_idle(self.directory, args)
+        client.assert_not_called()
+        stop.assert_not_called()
+
+    def test_controls_retain_terminal_snapshot_before_stopping_backend(self):
+        from argparse import Namespace
+        args = Namespace(timeout=0, max_steps=None, max_output_tokens=None,
+                         context_window=None, model_output_limit=None, long_context=None)
+        final = {'request_id': 'm', 'status': 'complete', 'native_status': 'idle',
+                 'questions': [], 'text': 'final control answer'}
+        api = mock.Mock()
+        api.snapshot.return_value = final
+        def stop(*args):
+            self.assertEqual(live.read(self.directory)['current_result'], final)
+            self.assertEqual((self.turn / 'result.txt').read_text(), 'final control answer')
+            raise OSError('fixture stops after retained proof')
+        with mock.patch.object(live, 'client', return_value=api), mock.patch.object(live, 'signal_owned', side_effect=stop):
+            with self.assertRaisesRegex(OSError, 'retained proof'):
+                live.configure_idle(self.directory, args)
+
     def test_recovery_snapshot_does_not_reap_active_work(self):
         live.update(self.directory, idle_reap_seconds=1)
         api, stopping = mock.Mock(), threading.Event()

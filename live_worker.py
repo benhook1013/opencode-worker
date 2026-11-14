@@ -373,6 +373,8 @@ def reconcile_owner_snapshot(directory, api, session, meta, result, idle_since, 
                 confirmed_idle = (api.request('GET', '/session/status').get(session, {'type': 'idle'})['type'] == 'idle'
                                   if confirmed is None else confirmed['status'] in TERMINAL and confirmed.get('native_status') == 'idle')
                 if confirmed_idle:
+                    if confirmed is not None:
+                        remember(directory, confirmed)
                     update(directory, stop_requested=True)
                     stopping.set()
     return idle_since
@@ -761,6 +763,12 @@ def configure_idle(directory, args):
             raise ValueError('Pending native submission is uncertain; inspect retained state before changing controls')
         if meta.get('server_lifecycle') == 'starting':
             raise ValueError('Native backend is starting; retry controls after it is running or stopped')
+        limits = batch.model_limits(meta['model'], args, meta)
+        budget = batch.output_budget(args, meta, limits)
+        steps = batch.step_limit(args, meta)
+        timeout = getattr(args, 'timeout', None)
+        if timeout is not None and timeout < 0:
+            raise ValueError('Timeout must be positive or 0 for unlimited')
         if meta.get('server_lifecycle') == 'running':
             api = client(directory)
             if meta.get('current_request_id'):
@@ -771,6 +779,8 @@ def configure_idle(directory, args):
             if (state['native_status'] != 'idle' or state['questions']
                     or (meta.get('current_request_id') and state.get('status') not in TERMINAL)):
                 raise ValueError('Control overrides require an idle worker; send without overrides to follow up live')
+            if meta.get('current_request_id'):
+                remember(directory, state)
             # Stop only this idle managed backend; the native DB/session remains.
             signal_owned(meta, 'owner', signal.SIGTERM)
             deadline = time.monotonic() + 10
@@ -778,12 +788,6 @@ def configure_idle(directory, args):
                 time.sleep(0.05)
             if read(directory).get('server_lifecycle') != 'stopped':
                 raise ValueError('Idle backend shutdown not confirmed; controls were not changed')
-        limits = batch.model_limits(meta['model'], args, meta)
-        budget = batch.output_budget(args, meta, limits)
-        steps = batch.step_limit(args, meta)
-        timeout = getattr(args, 'timeout', None)
-        if timeout is not None and timeout < 0:
-            raise ValueError('Timeout must be positive or 0 for unlimited')
         long_context = meta.get('long_context', False) if args.long_context is None else args.long_context
         settings = batch.config(meta['model'], meta['reasoning'], meta['allow_write'], steps,
             key=batch.KEY, worktree=meta['worktree'], limits=limits, long_context=long_context)

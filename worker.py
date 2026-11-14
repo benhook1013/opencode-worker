@@ -291,8 +291,8 @@ def credit_save(exhausted, reason):
 
 def credit_latch(reason):
     """Caller holds credit_lock; failed persistence must not leave an open guard."""
-    credit_state()
     try:
+        credit_state()
         return credit_save(True, reason)
     except (OSError, ValueError):
         # Missing guards already fail closed and require explicit owner reset.

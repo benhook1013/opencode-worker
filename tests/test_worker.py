@@ -361,10 +361,9 @@ class CreditGuardTests(unittest.TestCase):
                 self.assertEqual(meta['credit_latch_error'], 'ValueError' if failure == 'state' else 'OSError')
                 self.assertIn('finished_at', meta)
                 self.assertEqual((path.parent / meta['latest_turn'] / 'result.txt').read_text(), 'Fixture done')
-                if failure == 'save':
-                    with self.assertRaisesRegex(ValueError, 'dispatch refused'):
-                        worker.credit_preflight()
-                    worker.credit_save(False, None)
+                with self.assertRaisesRegex(ValueError, 'dispatch refused'):
+                    worker.credit_preflight()
+                worker.credit_save(False, None)
 
     def test_batch_overflow_recovery_preserves_native_exit_code(self):
         overflow = {'type': 'error', 'error': {'name': 'ContextOverflowError'}}
