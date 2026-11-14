@@ -541,7 +541,7 @@ def _send(directory, task, submission_id=None):
                 raise ValueError('Prior request is still active; wait or cancel before a distinct submission')
         turn = directory / ('turn-' + uuid.uuid4().hex)
         batch.private_dir(turn)
-        (turn / 'task.txt').write_text(task)
+        batch.durable_text(turn / 'task.txt', task)
         with batch.credit_lock():
             batch.credit_preflight()
             atomic(turn / 'receipt.json', {'submission_id': submission_id, 'task_sha256': fingerprint,

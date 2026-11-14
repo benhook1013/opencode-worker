@@ -620,3 +620,22 @@ class ReviewRegressions(unittest.TestCase):
                 live.send(self.directory, 'second task', 'second')
             api.stage.assert_called_once()
             api.dispatch.assert_not_called()
+
+    def test_batch_task_durability_failure_prevents_launch(self):
+        args, key = self.batch_args()
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(worker, 'KEY', key), mock.patch.object(worker, 'durable_text', side_effect=OSError('task fsync failed')) as durable, mock.patch.object(worker.subprocess, 'Popen') as launch:
+            with worker.credit_lock(): worker.credit_save(False, None)
+            with self.assertRaisesRegex(OSError, 'task fsync failed'):
+                worker.execute(args)
+            self.assertEqual(durable.call_args.args[0].name, 'task.txt')
+            launch.assert_not_called()
+
+    def test_managed_task_durability_failure_prevents_staging(self):
+        api = mock.Mock()
+        api.snapshot.return_value = {'status': 'complete', 'native_status': 'idle', 'request_id': 'm'}
+        with mock.patch.object(live, 'require_known_dispatch'), mock.patch.object(live.batch, 'credit_lock', side_effect=contextlib.nullcontext), mock.patch.object(live.batch, 'credit_preflight'), mock.patch.object(live.batch, 'validate_worktree'), mock.patch.object(live, 'ensure_server'), mock.patch.object(live, 'remember'), mock.patch.object(live, 'client', return_value=api), mock.patch.object(worker, 'durable_text', side_effect=OSError('task fsync failed')) as durable:
+            with self.assertRaisesRegex(OSError, 'task fsync failed'):
+                live.send(self.directory, 'durable task', 'durable')
+            self.assertEqual(durable.call_args.args[0].name, 'task.txt')
+            api.stage.assert_not_called()
+            api.dispatch.assert_not_called()

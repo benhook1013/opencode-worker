@@ -521,7 +521,7 @@ def execute(args):
         credential_check(KEY)
         turn = directory / ('turn-' + uuid.uuid4().hex)
         private_dir(turn)
-        (turn / 'task.txt').write_text(task)
+        durable_text(turn / 'task.txt', task)
         settings = config(meta['model'], meta['reasoning'], meta['allow_write'], meta['steps'], key=KEY, worktree=worktree, limits=limits, long_context=meta['long_context'])
         save(turn / 'config.json', settings)  # File reference only; never key contents.
         command = [str(BINARY), 'run', '--pure', '--format', 'json', '--dir', str(worktree),
