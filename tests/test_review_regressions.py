@@ -571,9 +571,10 @@ class ReviewRegressions(unittest.TestCase):
         base = ['--task-file', 'fixture', '--worktree', '/tmp', '--model', 'gpt-6-luna', '--reasoning', 'high']
         for command in (['start'], ['run', '--live']):
             for flag, expected in (([], False), (['--long-context'], True), (['--no-long-context'], False)):
-                with self.subTest(command=command, flag=flag), mock.patch.object(live, 'start', return_value={'run_id': 'fixture'}) as start, mock.patch.object(live, 'wait', return_value={'status': 'complete'}), contextlib.redirect_stdout(io.StringIO()):
+                with self.subTest(command=command, flag=flag), mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'start', return_value={'run_id': 'fixture'}) as start, mock.patch.object(live, 'wait', return_value={'status': 'complete'}), contextlib.redirect_stdout(io.StringIO()):
                     cli_router.main(command + base + flag)
                     self.assertIs(start.call_args.args[0].long_context, expected)
+                    self.assertTrue((self.root / 'start.lock').is_file())
 
     def test_staged_unadopted_receipt_blocks_distinct_submission(self):
         orphan = self.directory / 'turn-orphan'
