@@ -553,3 +553,69 @@ class ReviewRegressions(unittest.TestCase):
         with mock.patch.object(install, 'SOURCE', source), mock.patch.object(install.shutil, 'copyfile', side_effect=OSError('original')), mock.patch.object(install, 'remove_tree', side_effect=OSError('cleanup')):
             with self.assertRaisesRegex(OSError, 'original; rollback also failed: cleanup'):
                 install.install(self.root / 'prefix')
+
+
+    def test_installer_rejects_external_bin_symlink_without_writes(self):
+        prefix = self.root / 'prefix'
+        prefix.mkdir()
+        external = self.root / 'external'
+        external.mkdir()
+        (prefix / 'bin').symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'inside the installation prefix'):
+            install.install(prefix)
+        self.assertEqual(list(external.iterdir()), [])
+        self.assertFalse((prefix / 'share').exists())
+
+    def test_managed_start_accepts_both_long_context_forms(self):
+        import io
+        base = ['--task-file', 'fixture', '--worktree', '/tmp', '--model', 'gpt-6-luna', '--reasoning', 'high']
+        for command in (['start'], ['run', '--live']):
+            for flag, expected in (([], False), (['--long-context'], True), (['--no-long-context'], False)):
+                with self.subTest(command=command, flag=flag), mock.patch.object(live, 'start', return_value={'run_id': 'fixture'}) as start, mock.patch.object(live, 'wait', return_value={'status': 'complete'}), contextlib.redirect_stdout(io.StringIO()):
+                    cli_router.main(command + base + flag)
+                    self.assertIs(start.call_args.args[0].long_context, expected)
+
+    def test_staged_unadopted_receipt_blocks_distinct_submission(self):
+        orphan = self.directory / 'turn-orphan'
+        orphan.mkdir()
+        live.atomic(orphan / 'receipt.json', {'request_id': 'orphan', 'submission_id': 'old',
+            'task_sha256': 'old', 'stage_status': 'staged', 'dispatch_status': 'pending'})
+        with mock.patch.object(live, 'require_known_dispatch'), mock.patch.object(live.batch, 'credit_lock', side_effect=contextlib.nullcontext), mock.patch.object(live.batch, 'credit_preflight'), mock.patch.object(live.batch, 'validate_worktree'), mock.patch.object(live, 'ensure_server'), mock.patch.object(live, 'client') as client:
+            with self.assertRaisesRegex(ValueError, 'Uncertain native staging receipt'):
+                live.send(self.directory, 'distinct task', 'distinct')
+            client.assert_not_called()
+        self.assertEqual(live.read(self.directory)['current_request_id'], 'm')
+        self.assertEqual(json.loads((orphan / 'receipt.json').read_text())['dispatch_status'], 'pending')
+
+    def test_question_clears_idle_grace_even_with_unchanged_assistant(self):
+        api = transport.NativeClient('http://127.0.0.1:1', 'fixture', '/tmp')
+        messages = [{'info': {'id': 'a', 'role': 'user'}, 'parts': [{'type': 'text', 'text': 'task'}]},
+            {'info': {'id': 'b', 'role': 'assistant', 'parentID': 'a', 'time': {}}, 'parts': []}]
+        clock = [0.0]
+        native = ['idle']
+        questions = [[]]
+        with mock.patch.object(api, 'messages_since', return_value=messages), mock.patch.object(api, 'questions', side_effect=lambda _: questions[0]), mock.patch.object(api, 'request', side_effect=lambda *a: {'s': {'type': native[0]}}), mock.patch.object(transport.time, 'monotonic', side_effect=lambda: clock[0]):
+            self.assertNotEqual(api.snapshot('s', 'a')['status'], 'incomplete')
+            clock[0] = transport.DISPATCH_GRACE_SECONDS + 1
+            native[0], questions[0] = 'busy', [{'id': 'q'}]
+            self.assertEqual(api.snapshot('s', 'a')['status'], 'needs_input')
+            self.assertNotIn(('s', 'a'), api.idle_unfinished)
+            native[0], questions[0] = 'idle', []
+            self.assertNotEqual(api.snapshot('s', 'a')['status'], 'incomplete')
+            clock[0] += transport.DISPATCH_GRACE_SECONDS + 1
+            self.assertEqual(api.snapshot('s', 'a')['status'], 'incomplete')
+
+
+    def test_metadata_adoption_failure_leaves_staged_receipt_blocking_next_task(self):
+        api = mock.Mock()
+        api.stage.return_value = ('orphan', {})
+        api.snapshot.return_value = {'status': 'complete', 'native_status': 'idle', 'request_id': 'm'}
+        with mock.patch.object(live, 'require_known_dispatch'), mock.patch.object(live.batch, 'credit_lock', side_effect=contextlib.nullcontext), mock.patch.object(live.batch, 'credit_preflight'), mock.patch.object(live.batch, 'validate_worktree'), mock.patch.object(live, 'ensure_server'), mock.patch.object(live, 'remember'), mock.patch.object(live, 'client', return_value=api):
+            with mock.patch.object(live, 'update', side_effect=OSError('metadata adoption failed')):
+                with self.assertRaisesRegex(OSError, 'metadata adoption failed'):
+                    live.send(self.directory, 'first task', 'first')
+            api.dispatch.assert_not_called()
+            with self.assertRaisesRegex(ValueError, 'Uncertain native staging receipt'):
+                live.send(self.directory, 'second task', 'second')
+            api.stage.assert_called_once()
+            api.dispatch.assert_not_called()

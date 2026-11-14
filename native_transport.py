@@ -208,6 +208,8 @@ class NativeClient:
             messages = self.messages_since(session_id, message_id)
             questions = self.questions(session_id)
             native = self.request('GET', '/session/status').get(session_id, {'type': 'idle'})['type']
+        if questions or native != 'idle':
+            self.idle_unfinished.pop((session_id, message_id), None)
         observed_at_ns = time.monotonic_ns()
         candidates, last_user = request_history(messages, message_id)
         result = {'session_id': session_id, 'request_id': message_id, 'status': 'running' if native != 'idle' else 'queued',

@@ -524,8 +524,13 @@ def _send(directory, task, submission_id=None):
             raise ValueError('Uncertain native submission blocks new tasks; inspect retained state. Nothing was redispatched.')
         if meta.get('stop_requested'):
             raise ValueError('Native backend is stopping; no task was staged. Retry explicitly after shutdown completes')
-        if any(json.loads(path.read_text()).get('stage_status') == 'pending'
-               for path in directory.glob('turn-*/receipt.json')):
+        def unresolved_receipt(path):
+            receipt = json.loads(path.read_text())
+            adopted = (meta.get('latest_turn') == path.parent.name
+                       and meta.get('current_request_id') == receipt.get('request_id'))
+            return (receipt.get('stage_status') == 'pending'
+                    or (receipt.get('dispatch_status') == 'pending' and not adopted))
+        if any(unresolved_receipt(path) for path in directory.glob('turn-*/receipt.json')):
             raise ValueError('Uncertain native staging receipt blocks new submissions; inspect retained state')
         batch.validate_worktree(meta['worktree'])
         api = client(directory)
@@ -819,11 +824,12 @@ def main(argv=None):
     new.add_argument('--wait', action='store_true', help='Print the start receipt, then block on native events')
     new.add_argument('--worker-id', type=batch.run_id, help='Optional stable ID: exactly 32 lowercase hexadecimal characters (for example, 0123456789abcdef0123456789abcdef); omit to generate one. The same initial assignment is not replayed')
     new.add_argument('--submission-id', help='Owner-supplied idempotency key for this task')
-    for flag in ('allow-write', 'allow-commands', 'long-context'):
+    for flag in ('allow-write', 'allow-commands'):
         help_text = {'allow-write': 'Enable native edit tools; does not restrict Bash filesystem writes',
-            'allow-commands': 'Grant broad native Bash execution, including writes/tests; omit for read-only or Validation NONE tasks',
-            'long-context': 'Opt in to full-window native compaction policy'}[flag]
+            'allow-commands': 'Grant broad native Bash execution, including writes/tests; omit for read-only or Validation NONE tasks'}[flag]
         new.add_argument('--' + flag, action='store_true', help=help_text)
+    new.add_argument('--long-context', action=argparse.BooleanOptionalAction, default=False,
+        help='Opt in to full-window native compaction policy; --no-long-context restores early compaction')
     for flag in ('max-output-tokens', 'max-steps', 'context-window', 'model-output-limit', 'timeout'):
         new.add_argument('--' + flag, type=int, help=('Advisory native step target, not an enforced tool-call cap; 0 clears saved target' if flag == 'max-steps' else None))
     for name in ('send', 'resume', 'wait', 'status', 'result', 'cancel', 'shutdown', 'reply'):

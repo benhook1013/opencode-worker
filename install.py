@@ -26,6 +26,8 @@ def install(prefix):
     launcher = prefix / 'bin/api-worker'
     if any(path.is_relative_to(runtime) for path in (prefix, destination.parent.resolve(), launcher.parent.resolve())):
         raise ValueError('Choose a --prefix, share and bin directories outside the source runtime')
+    if not launcher.parent.resolve().is_relative_to(prefix):
+        raise ValueError('Launcher bin directory must remain inside the installation prefix')
     if destination.exists() or destination.is_symlink() or launcher.exists() or launcher.is_symlink():
         raise ValueError('Refusing existing api-worker destination or launcher; choose a fresh --prefix')
     if not (runtime / 'node_modules/opencode-linux-x64/bin/opencode').is_file():
