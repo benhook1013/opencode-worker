@@ -1022,7 +1022,9 @@ class LiveBoundaryTests(unittest.TestCase):
             live.start(args)
             directory = self.root / args.worker_id
             live.update(directory, current_request_id='native-accepted')
-            live.start(args)
+            with mock.patch.object(live.batch, 'credit_preflight', side_effect=ValueError('credits exhausted')) as preflight:
+                live.start(args)
+                preflight.assert_not_called()
             self.assertEqual(send.call_count, 2)
             live.update(directory, status='complete', current_result={'status': 'complete'})
             args.submission_id = None
@@ -1238,6 +1240,21 @@ class CompactionLineageTests(unittest.TestCase):
             assistant('h', 'g', summary=True, text='Second native summary'),
             user('i', [{'type': 'text', 'synthetic': True, 'metadata': {'compaction_continue': True}}]),
             assistant('j', 'i', text='Actual delegated answer')]
+
+    def test_earlier_stop_does_not_complete_unanswered_owned_work(self):
+        messages = self.messages()[:5]
+        messages[1] = self.assistant('b', 'a', text='Earlier stop')
+        for history in (messages[:3], messages[:4], messages):
+            with self.subTest(last=history[-1]['info']['id']):
+                self.assertNotEqual(self.snapshot(history)['status'], 'complete')
+        answered = messages + [self.assistant('f', 'e', text='Final continuation answer')]
+        self.assertEqual(self.snapshot(answered)['status'], 'complete')
+        client = transport.NativeClient('http://127.0.0.1:1', 'fixture-only', '/fixture')
+        with mock.patch.object(client, 'messages_since', return_value=messages), mock.patch.object(client, 'request', side_effect=lambda method, path: [] if path == '/question' else {}):
+            with mock.patch.object(transport.time, 'monotonic', return_value=100):
+                self.assertEqual(client.snapshot('native-fixture', 'a')['status'], 'queued')
+            with mock.patch.object(transport.time, 'monotonic', return_value=111):
+                self.assertEqual(client.snapshot('native-fixture', 'a')['incomplete_reason'], 'idle_unanswered_continuation')
 
     def failed_compaction(self):
         messages = self.messages()[:4]

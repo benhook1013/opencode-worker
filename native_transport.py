@@ -34,12 +34,12 @@ def snapshot_due(event, last_snapshot):
             or kind.startswith('question.') or time.monotonic() - last_snapshot >= 1)
 
 
-def request_assistants(messages, message_id):
+def request_history(messages, message_id):
     """Follow only pinned native auto-compaction markers until the next explicit turn."""
     ordered = sorted(messages, key=lambda message: message['info']['id'])
     start = next((index for index, message in enumerate(ordered) if message['info']['id'] == message_id), None)
     if start is None:
-        return []  # No ancestry proof: never borrow an arbitrary later assistant answer.
+        return [], None  # No ancestry proof: never borrow an arbitrary later assistant answer.
     parents, compactions, completed_compactions = {message_id}, set(), set()
     overflow_compactions = set()
     last_user = message_id
@@ -75,7 +75,11 @@ def request_assistants(messages, message_id):
                 continue  # A compaction summary is not the delegated task's final answer.
             if info.get('parentID') in parents:
                 candidates.append(message)
-    return candidates
+    return candidates, last_user
+
+
+def request_assistants(messages, message_id):
+    return request_history(messages, message_id)[0]
 
 
 class NativeClient:
@@ -205,7 +209,7 @@ class NativeClient:
             questions = self.questions(session_id)
             native = self.request('GET', '/session/status').get(session_id, {'type': 'idle'})['type']
         observed_at_ns = time.monotonic_ns()
-        candidates = request_assistants(messages, message_id)
+        candidates, last_user = request_history(messages, message_id)
         result = {'session_id': session_id, 'request_id': message_id, 'status': 'running' if native != 'idle' else 'queued',
                   'native_status': native, 'text': '', 'questions': questions, 'observed_at_ns': observed_at_ns, 'observed_boot_id': boot_id(),
                   'execution_observed': bool(candidates)}
@@ -223,6 +227,27 @@ class NativeClient:
             return result  # Staging/initial idle without acknowledgement is never completion.
         latest = max(candidates, key=lambda item: item['info']['id'])
         info, parts = latest['info'], latest['parts']
+        if (info.get('parentID') != last_user and info.get('finish') == 'stop'
+                and not info.get('error') and not info.get('summary')):
+            result['finish_reason'] = info.get('finish')
+            result['text'] = '\n\n'.join(p.get('text', '') for p in parts if p.get('type') == 'text')
+            # An owned compaction/continuation supersedes an earlier stop answer.
+            # Keep observing, including a bounded stable-idle failure, until the
+            # newest owned user turn has its own assistant response.
+            key = (session_id, message_id)
+            if native == 'idle' and not questions:
+                signature = hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest()
+                previous = self.idle_unfinished.get(key)
+                if previous is None or previous[0] != signature:
+                    self.idle_unfinished[key] = (signature, time.monotonic())
+                elif time.monotonic() - previous[1] >= DISPATCH_GRACE_SECONDS:
+                    result.update(status='incomplete', incomplete_reason='idle_unanswered_continuation')
+                result['idle_unfinished_evidence'] = {
+                    'signature': signature, 'since': self.idle_unfinished[key][1],
+                    'boot_id': result['observed_boot_id']}
+            elif native != 'idle':
+                self.idle_unfinished.pop(key, None)
+            return result
         if not info.get('summary'):
             result['text'] = '\n\n'.join(p.get('text', '') for p in parts if p.get('type') == 'text')
         if questions:

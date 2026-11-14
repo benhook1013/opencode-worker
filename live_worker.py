@@ -675,8 +675,6 @@ def wait_once(directory, request_id=None):
 
 
 def start(args):
-    with batch.credit_lock():
-        batch.credit_preflight()
     batch.credential_check(batch.KEY)
     task = Path(args.task_file).read_text()
     if not task.strip():
@@ -706,6 +704,8 @@ def start(args):
             raise ValueError('Submission ID differs from the initial assignment; nothing was replayed')
         require_known_dispatch(directory)
         return send(directory, task, initial_id)
+    with batch.credit_lock():
+        batch.credit_preflight()
     batch.private_dir(directory)
     # Older wait commands could leave a control lock before initialization.
     for entry in directory.iterdir():
