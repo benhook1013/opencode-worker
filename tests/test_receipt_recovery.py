@@ -32,6 +32,33 @@ class ReceiptRecoveryTests(unittest.TestCase):
         live.remember(self.directory, question)
         self.assertEqual(live.read(self.directory)['current_result']['status'], 'complete')
 
+    def test_resumed_provisional_receipt_reports_activity_and_enforces_timeout(self):
+        for observation in ({'status': 'running', 'native_status': 'busy'},
+                            {'status': 'running', 'native_status': 'idle'}):
+            with self.subTest(observation=observation):
+                incomplete = {'request_id': 'm', 'status': 'incomplete',
+                              'incomplete_reason': 'idle_unfinished_assistant',
+                              'idle_unfinished_evidence': {'stale': True},
+                              'observed_at_ns': 1, 'observed_boot_id': 'boot'}
+                resumed = {'request_id': 'm', 'observed_at_ns': 2,
+                           'observed_boot_id': 'boot', **observation}
+                live.update(self.directory, current_result=None, timeout_seconds=2, submitted_at=1)
+                live.remember(self.directory, incomplete)
+                live.remember(self.directory, resumed)
+                live.remember(self.directory, incomplete)  # Older observation cannot re-terminalize.
+                meta = live.read(self.directory)
+                self.assertEqual(meta['status'], 'running')
+                self.assertEqual(meta['current_result'], resumed)
+                self.assertEqual(json.loads((self.directory / 'turn/status.json').read_text()), resumed)
+                with patch.object(live, 'client') as client, patch.object(live.time, 'time', return_value=10):
+                    client.return_value.snapshot.return_value = resumed
+                    self.assertEqual(live.status(self.directory)['status'], 'running')
+                    live.enforce_timeout(self.directory, client.return_value, 's')
+                    client.return_value.abort.assert_called_once_with('s')
+                live.remember(self.directory, {'request_id': 'm', 'status': 'complete', 'text': 'done'})
+                live.remember(self.directory, resumed)
+                self.assertEqual(live.read(self.directory)['current_result']['status'], 'complete')
+
     def test_compaction_failure_confirms_lost_dispatch_without_summary_answer(self):
         messages = [ {'info':{'id':'m','role':'user'},'parts':[]},
             {'info':{'id':'n','role':'user'},'parts':[{'type':'compaction','auto':True}]},

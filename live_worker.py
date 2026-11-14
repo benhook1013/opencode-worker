@@ -167,7 +167,9 @@ def remember(directory, result):
             return
         pending_question = (prior.get('incomplete_reason') == 'idle_unfinished_assistant'
                             and result.get('status') == 'needs_input' and bool(result.get('questions')))
-        if prior.get('status') in TERMINAL and result.get('status') not in TERMINAL and not pending_question:
+        resumed_provisional = (prior.get('incomplete_reason') == 'idle_unfinished_assistant'
+                               and (result.get('native_status') == 'busy' or result.get('status') == 'running'))
+        if prior.get('status') in TERMINAL and result.get('status') not in TERMINAL and not (pending_question or resumed_provisional):
             if prior.get('incomplete_reason') == 'idle_unfinished_assistant':
                 # Keep the terminal receipt, but replace/invalidate stability evidence
                 # when a newer native observation shows changed output or activity.
