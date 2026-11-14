@@ -866,9 +866,9 @@ def main(argv=None):
             # Serialize cancellation and shutdown, including native cleanup, against send.
             with locked(directory / 'control.lock'):
                 meta = read(directory)
+                if meta.get('server_lifecycle') == 'starting':
+                    raise ValueError(f'Backend is starting; retry {args.action} after it reports running or stopped')
                 if args.action == 'shutdown':
-                    if meta.get('server_lifecycle') == 'starting':
-                        raise ValueError('Backend is starting; retry shutdown after it reports running or stopped')
                     update(directory, stop_requested=True)
                 if meta.get('server_lifecycle') == 'running':
                     api = client(directory)

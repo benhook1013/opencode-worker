@@ -466,6 +466,14 @@ class ReviewRegressions(unittest.TestCase):
         api.assert_not_called()
         self.assertEqual(live.read(self.directory)['server_lifecycle'], 'starting')
 
+    def test_cancel_starting_is_not_reported_requested(self):
+        live.update(self.directory, server_lifecycle='starting')
+        with mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'client') as api:
+            with self.assertRaisesRegex(ValueError, 'Backend is starting; retry cancel'):
+                live.main(['cancel', self.directory.name])
+        api.assert_not_called()
+        self.assertEqual(live.read(self.directory)['server_lifecycle'], 'starting')
+
     def test_quiet_owner_ticks_keep_one_subscription(self):
         import threading
         release = threading.Event()
