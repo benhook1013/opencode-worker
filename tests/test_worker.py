@@ -18,6 +18,39 @@ spec.loader.exec_module(worker)
 
 
 class LauncherTests(unittest.TestCase):
+    def test_durable_text_preserves_old_result_before_replace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'result.txt'
+            path.write_text('committed answer')
+            for target in ('fsync', 'replace'):
+                with self.subTest(target=target), mock.patch.object(
+                        worker.os, target, side_effect=OSError('interrupted')):
+                    with self.assertRaisesRegex(OSError, 'interrupted'):
+                        worker.durable_text(path, 'replacement')
+                self.assertEqual(path.read_text(), 'committed answer')
+                self.assertEqual(list(Path(temp).iterdir()), [path])
+
+    def test_durable_text_syncs_replacement_before_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'result.txt'
+            path.write_text('old')
+            events = []
+            real_sync, real_replace = worker.os.fsync, worker.os.replace
+            def sync(fd):
+                events.append('sync')
+                return real_sync(fd)
+            def replace(source, destination):
+                self.assertEqual(path.read_text(), 'old')
+                self.assertEqual(Path(source).read_text(), 'new')
+                events.append('replace')
+                return real_replace(source, destination)
+            with mock.patch.object(worker.os, 'fsync', side_effect=sync), mock.patch.object(
+                    worker.os, 'replace', side_effect=replace):
+                worker.durable_text(path, 'new')
+            self.assertEqual(events, ['sync', 'replace', 'sync'])
+            self.assertEqual(path.read_text(), 'new')
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     def test_no_inherited_secrets_and_native_tools_are_bounded(self):
         with tempfile.TemporaryDirectory() as temp:
             os.environ['OPENAI_API_KEY'] = 'fixture-only'

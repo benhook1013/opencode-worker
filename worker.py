@@ -53,11 +53,21 @@ def sync_directory(path):
 
 
 def durable_text(path, text):
-    with path.open('w') as receipt:
-        receipt.write(text)
-        receipt.flush()
-        os.fsync(receipt.fileno())
-    sync_directory(path.parent)
+    # Observers may rewrite an already committed result. Keep the previous
+    # artifact intact until the replacement is fully written and synchronized.
+    descriptor, temporary = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as receipt:
+            receipt.write(text)
+            receipt.flush()
+            os.fsync(receipt.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def private_dir(path):
