@@ -202,7 +202,7 @@ class ReviewRegressions(unittest.TestCase):
         api.snapshot.return_value = result
         with mock.patch.object(live.time, 'monotonic', return_value=10):
             since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), result, None, stopping)
-        self.assertEqual(since, 10)
+        self.assertEqual(since, ('m', 10))
         self.assertFalse(stopping.is_set())
         with mock.patch.object(live.time, 'monotonic', return_value=12):
             live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), result, since, stopping)
@@ -217,7 +217,7 @@ class ReviewRegressions(unittest.TestCase):
         api, stopping = mock.Mock(), threading.Event()
         api.snapshot.return_value = final
         with mock.patch.object(live.time, 'monotonic', return_value=12):
-            live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), provisional, 10, stopping)
+            live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), provisional, ('m', 10), stopping)
         self.assertTrue(stopping.is_set())
         self.assertEqual(live.read(self.directory)['current_result'], final)
         self.assertEqual((self.turn / 'result.txt').read_text(), 'final answer')
@@ -251,11 +251,44 @@ class ReviewRegressions(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'retained proof'):
                 live.configure_idle(self.directory, args)
 
+    def test_idle_timer_restarts_for_new_request_without_observed_activity(self):
+        live.update(self.directory, idle_reap_seconds=30)
+        api, stopping = mock.Mock(), threading.Event()
+        result = {'request_id': 'm', 'status': 'complete', 'native_status': 'idle'}
+        api.snapshot.return_value = result
+        with mock.patch.object(live.time, 'monotonic', return_value=39):
+            since = live.reconcile_owner_snapshot(self.directory, api, 's',
+                live.read(self.directory), result, ('previous', 10), stopping)
+        self.assertEqual(since, ('m', 39))
+        self.assertFalse(stopping.is_set())
+        with mock.patch.object(live.time, 'monotonic', return_value=40):
+            since = live.reconcile_owner_snapshot(self.directory, api, 's',
+                live.read(self.directory), result, since, stopping)
+        self.assertEqual(since, ('m', 39))
+        self.assertFalse(stopping.is_set())
+        api.snapshot.assert_not_called()
+        with mock.patch.object(live.time, 'monotonic', return_value=69):
+            live.reconcile_owner_snapshot(self.directory, api, 's',
+                live.read(self.directory), result, since, stopping)
+        self.assertTrue(stopping.is_set())
+
+    def test_idle_unanswered_continuation_can_resume_or_ask_question(self):
+        for result in [
+                {'status': 'running', 'native_status': 'busy'},
+                {'status': 'needs_input', 'questions': [{'id': 'q'}]}]:
+            with self.subTest(result=result):
+                prior = {'request_id': 'm', 'status': 'incomplete',
+                         'incomplete_reason': 'idle_unanswered_continuation'}
+                live.update(self.directory, current_result=prior)
+                expected = {'request_id': 'm', **result}
+                live.remember(self.directory, expected)
+                self.assertEqual(live.read(self.directory)['current_result'], expected)
+
     def test_recovery_snapshot_does_not_reap_active_work(self):
         live.update(self.directory, idle_reap_seconds=1)
         api, stopping = mock.Mock(), threading.Event()
         result = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
-        since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), result, 1, stopping)
+        since = live.reconcile_owner_snapshot(self.directory, api, 's', live.read(self.directory), result, ('m', 1), stopping)
         self.assertIsNone(since)
         self.assertFalse(stopping.is_set())
         api.snapshot.assert_not_called()

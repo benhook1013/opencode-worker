@@ -165,12 +165,12 @@ def remember(directory, result):
         if (prior.get('observed_boot_id') and prior.get('observed_boot_id') == result.get('observed_boot_id')
                 and prior.get('observed_at_ns', 0) > result.get('observed_at_ns', 0)):
             return
-        pending_question = (prior.get('incomplete_reason') == 'idle_unfinished_assistant'
+        pending_question = (prior.get('incomplete_reason') in ('idle_unfinished_assistant', 'idle_unanswered_continuation')
                             and result.get('status') == 'needs_input' and bool(result.get('questions')))
-        resumed_provisional = (prior.get('incomplete_reason') == 'idle_unfinished_assistant'
+        resumed_provisional = (prior.get('incomplete_reason') in ('idle_unfinished_assistant', 'idle_unanswered_continuation')
                                and (result.get('native_status') == 'busy' or result.get('status') == 'running'))
         if prior.get('status') in TERMINAL and result.get('status') not in TERMINAL and not (pending_question or resumed_provisional):
-            if prior.get('incomplete_reason') == 'idle_unfinished_assistant':
+            if prior.get('incomplete_reason') in ('idle_unfinished_assistant', 'idle_unanswered_continuation'):
                 # Keep the terminal receipt, but replace/invalidate stability evidence
                 # when a newer native observation shows changed output or activity.
                 prior = dict(prior)
@@ -363,9 +363,9 @@ def reconcile_owner_snapshot(directory, api, session, meta, result, idle_since, 
     idle = (api.request('GET', '/session/status').get(session, {'type': 'idle'})['type'] == 'idle'
             if result is None else result['status'] in TERMINAL and result.get('native_status') == 'idle')
     now = time.monotonic()
-    idle_since = (now if idle_since is None else idle_since) if idle else None
+    idle_since = ((message, now) if idle_since is None or idle_since[0] != message else idle_since) if idle else None
     enforce_timeout(directory, api, session, stopping=stopping)
-    if idle_since is not None and now - idle_since >= (meta.get('idle_reap_seconds', 30) if message else 30):
+    if idle_since is not None and now - idle_since[1] >= (meta.get('idle_reap_seconds', 30) if message else 30):
         with locked(directory / 'control.lock', stopping=stopping):
             latest = read(directory)
             if latest.get('current_request_id') == message:
