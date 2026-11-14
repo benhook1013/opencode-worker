@@ -1099,7 +1099,8 @@ class LiveBoundaryTests(unittest.TestCase):
     def test_wait_cursor_cannot_report_an_old_request_as_new_completion(self):
         live.atomic(self.directory / 'metadata.json', {'current_request_id': 'native-old', 'session_id': 'native-session'})
         api = mock.Mock()
-        def advance(session, request, observer):
+        def advance(session, request, observer, timeout):
+            self.assertEqual(timeout, 5)
             live.update(self.directory, current_request_id='native-new')
             observer({'type': 'server.heartbeat'})
         api.wait.side_effect = advance

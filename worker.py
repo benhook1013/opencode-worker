@@ -83,7 +83,10 @@ def private_dir(path):
         raise ValueError(f'Expected owned private directory (0700): {path}')
     # Also sync existing ancestors: a previous failed attempt may have created an
     # entry but failed before syncing it. Never dispatch on that retry shortcut.
+    created_parents = {directory.absolute().parent for directory in missing}
     for parent in path.absolute().parents:
+        if parent not in created_parents and parent.stat().st_uid != os.getuid():
+            break
         sync_directory(parent)
 
 
@@ -110,6 +113,9 @@ def validate_worktree(value):
             raise ValueError('Worktree must not contain the configured credential directory or worker state')
     visited = set()
     def traversal_error(error):
+        if (isinstance(error, PermissionError) and error.filename
+                and not os.access(error.filename, os.X_OK)):
+            return  # Same-user tools cannot traverse this directory either.
         raise ValueError('Cannot validate worktree symlinks') from error
     for root, directories, files in os.walk(directory, followlinks=True, onerror=traversal_error):
         resolved_root = Path(root).resolve(strict=True)

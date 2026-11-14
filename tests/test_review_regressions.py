@@ -30,6 +30,48 @@ class ReviewRegressions(unittest.TestCase):
             'model': 'openai/gpt-6-luna', 'reasoning': 'high', 'server_lifecycle': 'running'})
         (self.root / 'project').mkdir()
 
+    def test_wait_recovers_retained_result_when_backend_stops_before_connect(self):
+        api = mock.Mock()
+        def bounded_wait(*args, **kwargs):
+            self.assertEqual(kwargs['timeout'], 5)
+            live.update(self.directory, current_result={'status': 'complete', 'request_id': 'm', 'text': 'retained'})
+            return {'status': 'running', 'request_id': 'm', 'wait_timed_out': True}
+        api.wait.side_effect = bounded_wait
+        with mock.patch.object(live, 'client', return_value=api), mock.patch.object(live, 'status', side_effect=[{'status': 'running'}, {'status': 'complete', 'request_id': 'm', 'text': 'retained'}]):
+            self.assertEqual(live.wait(self.directory)['text'], 'retained')
+
+    def test_wait_timeout_surfaces_request_supersession(self):
+        api = mock.Mock()
+        def bounded_wait(*args, **kwargs):
+            self.assertEqual(kwargs['timeout'], 5)
+            live.update(self.directory, current_request_id='new')
+            return {'status': 'running', 'wait_timed_out': True}
+        api.wait.side_effect = bounded_wait
+        with mock.patch.object(live, 'client', return_value=api), mock.patch.object(live, 'status', return_value={'status': 'running'}):
+            self.assertEqual(live.wait(self.directory, 'm')['status'], 'superseded')
+
+    def test_worktree_traversal_skips_only_unsearchable_permission_denial(self):
+        project = self.root / 'project'
+        def walk(*args, **kwargs):
+            kwargs['onerror'](PermissionError(13, 'denied', str(project / 'private')))
+            return iter(())
+        with mock.patch.object(worker.os, 'walk', side_effect=walk), mock.patch.object(worker.os, 'access', return_value=False):
+            self.assertEqual(worker.validate_worktree(project), project)
+        with mock.patch.object(worker.os, 'walk', side_effect=walk), mock.patch.object(worker.os, 'access', return_value=True):
+            with self.assertRaisesRegex(ValueError, 'Cannot validate'):
+                worker.validate_worktree(project)
+
+    def test_private_directory_stops_at_existing_foreign_ancestor(self):
+        original = Path.stat
+        def info(path, *args, **kwargs):
+            result = original(path, *args, **kwargs)
+            if path == self.root.parent:
+                return mock.Mock(st_uid=os.getuid() + 1)
+            return result
+        with mock.patch.object(Path, 'stat', info), mock.patch.object(worker, 'sync_directory') as sync:
+            worker.private_dir(self.directory)
+        self.assertEqual(sync.call_args_list, [mock.call(self.root)])
+
     def test_wait_reobserves_newer_nonterminal_result_on_same_cursor(self):
         with mock.patch.object(live, 'wait_once', side_effect=[{'status': 'running'}, {'status': 'complete'}]) as observe:
             self.assertEqual(live.wait(self.directory)['status'], 'complete')

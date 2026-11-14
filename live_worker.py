@@ -670,8 +670,12 @@ def wait_once(directory, request_id=None):
             raise RequestAdvanced()
         observe(directory, event)
     try:
-        result = client(directory).wait(meta['session_id'], meta['current_request_id'], observer=observer)
-        remember(directory, result)
+        result = client(directory).wait(
+            meta['session_id'], meta['current_request_id'], observer=observer, timeout=5)
+        if result.get('wait_timed_out'):
+            result = status(directory)  # Recheck retained state between bounded observations.
+        else:
+            remember(directory, result)
     except RequestAdvanced:
         result = {'status': 'superseded', 'request_id': meta['current_request_id']}
     except OSError:
