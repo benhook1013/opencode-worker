@@ -521,6 +521,58 @@ class ReviewRegressions(unittest.TestCase):
         live.remember(self.directory, result)
         self.assertNotIn('reason', live.wait_result(self.directory, result, 'm'))
 
+    def test_timeout_revalidates_retained_provisional_idle_after_deadline(self):
+        for reason in ('idle_unfinished_assistant', 'idle_unanswered_continuation'):
+            with self.subTest(reason=reason):
+                retained = {'request_id': 'm', 'status': 'incomplete',
+                    'native_status': 'idle', 'incomplete_reason': reason}
+                live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5,
+                    current_result=retained, request_cancellation=None)
+                api = mock.Mock()
+                api.snapshot.side_effect = OSError('cannot observe resumed request')
+                api.abort.return_value = True
+
+                live.enforce_timeout(self.directory, api, 's')
+
+                self.assertEqual(api.mock_calls, [mock.call.snapshot('s', 'm'), mock.call.abort('s')])
+                meta = live.read(self.directory)
+                self.assertEqual(meta['current_result'], retained)
+                self.assertIsNone(meta['request_cancellation'])
+
+    def test_timeout_aborts_observed_resumed_work_after_provisional_idle(self):
+        retained = {'request_id': 'm', 'status': 'incomplete',
+            'native_status': 'idle', 'incomplete_reason': 'idle_unfinished_assistant'}
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5,
+            current_result=retained)
+        api = mock.Mock()
+        api.snapshot.return_value = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
+        api.abort.return_value = True
+
+        live.enforce_timeout(self.directory, api, 's')
+
+        self.assertEqual(api.mock_calls, [mock.call.snapshot('s', 'm'), mock.call.abort('s')])
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+            {'request_id': 'm', 'timeout_seconds': 2})
+
+    def test_timeout_preserves_definitive_result_or_unexpired_provisional_idle(self):
+        for status, reason, expired in (
+                ('complete', None, True),
+                ('incomplete', 'other_terminal_reason', True),
+                ('incomplete', 'idle_unanswered_continuation', False)):
+            with self.subTest(status=status, reason=reason, expired=expired):
+                retained = {'request_id': 'm', 'status': status, 'incomplete_reason': reason}
+                live.update(self.directory, timeout_seconds=60 if not expired else 2,
+                    submitted_at=time.time() - (5 if expired else 0),
+                    current_result=retained, request_cancellation=None)
+                api = mock.Mock()
+
+                live.enforce_timeout(self.directory, api, 's')
+
+                self.assertEqual(api.mock_calls, [])
+                meta = live.read(self.directory)
+                self.assertEqual(meta['current_result'], retained)
+                self.assertIsNone(meta['request_cancellation'])
+
     def test_timeout_rereads_request_after_control_lock(self):
         live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
         original_lock = live.locked

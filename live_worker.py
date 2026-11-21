@@ -23,6 +23,7 @@ from native_transport import NativeClient, live_settings, snapshot_due
 
 ROOT = Path(__file__).resolve().parent
 TERMINAL = {'complete', 'incomplete', 'failed', 'interrupted'}
+PROVISIONAL_IDLE_REASONS = {'idle_unfinished_assistant', 'idle_unanswered_continuation'}
 
 
 class RequestAdvanced(Exception):
@@ -118,9 +119,13 @@ def enforce_timeout(directory, api, session, stopping=None):
         meta = read(directory)
         timeout = meta.get('timeout_seconds')
         request_id = meta.get('current_request_id')
-        if (not timeout or not request_id
-                or (meta.get('current_result') or {}).get('status') in TERMINAL
-                or time.time() - meta.get('submitted_at', time.time()) < timeout):
+        if not timeout or not request_id or time.time() - meta.get('submitted_at', time.time()) < timeout:
+            return
+        retained = meta.get('current_result') or {}
+        # A provisional idle result can be superseded by resumed native work.
+        if retained.get('status') in TERMINAL and not (
+                retained.get('status') == 'incomplete'
+                and retained.get('incomplete_reason') in PROVISIONAL_IDLE_REASONS):
             return
         try:
             current = api.snapshot(session, request_id)
@@ -214,12 +219,12 @@ def remember(directory, result):
         if (prior.get('observed_boot_id') and prior.get('observed_boot_id') == result.get('observed_boot_id')
                 and prior.get('observed_at_ns', 0) > result.get('observed_at_ns', 0)):
             return
-        pending_question = (prior.get('incomplete_reason') in ('idle_unfinished_assistant', 'idle_unanswered_continuation')
+        pending_question = (prior.get('incomplete_reason') in PROVISIONAL_IDLE_REASONS
                             and result.get('status') == 'needs_input' and bool(result.get('questions')))
-        resumed_provisional = (prior.get('incomplete_reason') in ('idle_unfinished_assistant', 'idle_unanswered_continuation')
+        resumed_provisional = (prior.get('incomplete_reason') in PROVISIONAL_IDLE_REASONS
                                and (result.get('native_status') == 'busy' or result.get('status') == 'running'))
         if prior.get('status') in TERMINAL and result.get('status') not in TERMINAL and not (pending_question or resumed_provisional):
-            if prior.get('incomplete_reason') in ('idle_unfinished_assistant', 'idle_unanswered_continuation'):
+            if prior.get('incomplete_reason') in PROVISIONAL_IDLE_REASONS:
                 # Keep the terminal receipt, but replace/invalidate stability evidence
                 # when a newer native observation shows changed output or activity.
                 prior = dict(prior)
