@@ -105,13 +105,44 @@ def owner_alive(meta):
     return bool(pid and ticks and process_identity(pid) == ticks)
 
 
+def cancel_request(directory, api, session, meta, timeout_seconds=None):
+    # Caller holds control.lock, which orders cancellation against send and shutdown.
+    request_id = meta.get('current_request_id')
+    previous = meta.get('request_cancellation') or {}
+    if api.abort(session) is True and request_id and previous.get('request_id') != request_id:
+        update(directory, request_cancellation={'request_id': request_id, 'timeout_seconds': timeout_seconds})
+
+
 def enforce_timeout(directory, api, session, stopping=None):
     with locked(directory / 'control.lock', stopping=stopping):
         meta = read(directory)
-        if (meta.get('timeout_seconds') and meta.get('current_request_id')
-                and (meta.get('current_result') or {}).get('status') not in TERMINAL
-                and time.time() - meta.get('submitted_at', time.time()) >= meta['timeout_seconds']):
+        timeout = meta.get('timeout_seconds')
+        request_id = meta.get('current_request_id')
+        if (not timeout or not request_id
+                or (meta.get('request_cancellation') or {}).get('request_id') == request_id
+                or (meta.get('current_result') or {}).get('status') in TERMINAL
+                or time.time() - meta.get('submitted_at', time.time()) < timeout):
+            return
+        try:
+            current = api.snapshot(session, request_id)
+        except (OSError, ValueError):
+            # Still enforce the deadline, but do not attribute an interruption
+            # when native observation could not rule out earlier termination.
             api.abort(session)
+            return
+        if current.get('status') in TERMINAL:
+            remember(directory, current)
+            return
+        cancel_request(directory, api, session, meta, timeout_seconds=timeout)
+
+
+def with_timeout_diagnostic(result, meta):
+    cancellation = meta.get('request_cancellation') or {}
+    timeout = cancellation.get('timeout_seconds')
+    if (timeout and result.get('status') == 'interrupted' and not meta.get('pending_dispatch')
+            and result.get('request_id') == cancellation.get('request_id') == meta.get('current_request_id')):
+        return {**result, **batch.timeout_diagnostic(timeout)}
+    return result
 
 
 def client(directory):
@@ -186,6 +217,7 @@ def remember(directory, result):
             return
         if result.get('execution_observed'):
             confirm_dispatch(directory, meta, result['request_id'], 'native_execution')
+        result = with_timeout_diagnostic(result, meta)
         turn = directory / meta['latest_turn']
         atomic(turn / 'status.json', result)
         batch.durable_text(turn / 'result.txt', result.get('text', ''))
@@ -557,7 +589,8 @@ def _send(directory, task, submission_id=None):
             atomic(turn / 'receipt.json', {'request_id': message, 'session_id': meta['session_id'],
                 'submission_id': submission_id, 'task_sha256': fingerprint, 'stage_status': 'staged', 'dispatch_status': 'pending'})
             update(directory, current_request_id=message, latest_turn=turn.name, submitted_at=time.time(),
-                   current_result=None, session_error=None, pending_submission=None, pending_dispatch=turn.name, status='queued')
+                   current_result=None, request_cancellation=None, session_error=None,
+                   pending_submission=None, pending_dispatch=turn.name, status='queued')
             try:
                 api.dispatch(meta['session_id'], message, payload)
             except OSError:
@@ -622,6 +655,7 @@ def status(directory):
             and result.get('error_attribution') != 'explicit_message_id'):
         result = {**result, 'unattributed_session_error': result['error']}
         result.pop('error')
+    result = with_timeout_diagnostic(result, latest)
     return {**result, 'run_id': directory.name, 'server_lifecycle': read(directory).get('server_lifecycle'),
             'native_server_lifetime_peak_rss_kib': read(directory).get('native_server_lifetime_peak_rss_kib'),
             'pricing_warning': read(directory).get('pricing_warning')}
@@ -644,6 +678,7 @@ def wait_result(directory, result, request_id):
                          or (retained.get('status') in TERMINAL
                              and result.get('status') not in TERMINAL))):
                 result = retained
+        result = with_timeout_diagnostic(result, meta)
         return {**result, 'run_id': directory.name, 'pricing_warning': meta.get('pricing_warning')}
 
 
@@ -884,7 +919,7 @@ def main(argv=None):
                     update(directory, stop_requested=True)
                 if meta.get('server_lifecycle') == 'running':
                     api = client(directory)
-                    api.abort(meta['session_id'])
+                    cancel_request(directory, api, meta['session_id'], meta)
                     if args.action == 'shutdown':
                         deadline = time.monotonic() + 10
                         while api.request('GET', '/session/status').get(meta['session_id'], {'type': 'idle'})['type'] != 'idle':
