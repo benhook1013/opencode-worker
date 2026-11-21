@@ -376,6 +376,23 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(live.read(self.directory)['request_cancellation'],
                          {'request_id': 'm', 'timeout_seconds': 2})
 
+    def test_timeout_retries_after_queued_idle_ack_and_attributes_when_running(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        api = mock.Mock()
+        api.snapshot.side_effect = [
+            {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'},
+            {'request_id': 'm', 'status': 'running', 'native_status': 'busy'},
+        ]
+        api.abort.return_value = True
+
+        live.enforce_timeout(self.directory, api, 's')
+        self.assertIsNone(live.read(self.directory).get('request_cancellation'))
+        live.enforce_timeout(self.directory, api, 's')
+
+        self.assertEqual(api.abort.call_count, 2)
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': 2})
+
     def test_timeout_diagnostic_survives_late_wait_and_distinct_send(self):
         api = mock.Mock()
         active = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
@@ -425,7 +442,9 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(live.main(['cancel', self.directory.name]), 0)
         live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
         live.enforce_timeout(self.directory, api, 's')
-        api.abort.assert_called_once_with('s')
+        api.abort.assert_has_calls([mock.call('s'), mock.call('s')])
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': None})
         result = {'request_id': 'm', 'status': 'interrupted', 'error': {'name': 'MessageAbortedError'}}
         live.remember(self.directory, result)
         self.assertNotIn('reason', live.wait_result(self.directory, result, 'm'))
