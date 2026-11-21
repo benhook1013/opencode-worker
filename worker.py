@@ -480,6 +480,11 @@ def recovered_overflow(events):
     return overflow and later_step and incomplete_reason(events) is None
 
 
+def timeout_diagnostic(seconds):
+    return {'reason': 'timeout', 'timeout_seconds': seconds,
+            'message': f'Timed out after {seconds} seconds. Existing edits remain in the worktree.'}
+
+
 def execute(args):
     with credit_lock():
         credit_preflight()
@@ -521,6 +526,8 @@ def execute(args):
         meta.pop('failure_reason', None)
         meta.pop('launch_error', None)
         meta.pop('credit_exhaustion_reason', None)
+        meta.pop('reason', None)
+        meta.pop('message', None)
         task = Path(args.task_file).read_text()
         if not task.strip():
             raise ValueError('Task file is empty')
@@ -571,8 +578,10 @@ def execute(args):
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     code = proc.returncode
                     status = 'complete' if code == 0 else 'failed'
-                except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                except (subprocess.TimeoutExpired, KeyboardInterrupt) as interruption:
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    if isinstance(interruption, subprocess.TimeoutExpired) and timeout is not None:
+                        meta.update(timeout_diagnostic(timeout))
                     if proc is not None:
                         try:
                             os.killpg(proc.pid, signal.SIGTERM)

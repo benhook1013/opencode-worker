@@ -1,6 +1,7 @@
 """Regression coverage for the latest hosted review, without live provider access."""
 import contextlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -368,8 +369,209 @@ class ReviewRegressions(unittest.TestCase):
     def test_timeout_is_enforced_without_events(self):
         live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
         api = mock.Mock()
+        api.snapshot.return_value = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
+        api.abort.return_value = True
         live.enforce_timeout(self.directory, api, 's')
         api.abort.assert_called_once_with('s')
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': 2})
+
+    def test_timeout_retries_after_queued_idle_ack_and_attributes_when_running(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        api = mock.Mock()
+        api.snapshot.side_effect = [
+            {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'},
+            {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'},
+            {'request_id': 'm', 'status': 'running', 'native_status': 'busy'},
+        ]
+        api.abort.return_value = True
+
+        live.enforce_timeout(self.directory, api, 's')
+        self.assertIsNone(live.read(self.directory).get('request_cancellation'))
+        live.enforce_timeout(self.directory, api, 's')
+
+        self.assertEqual(api.abort.call_count, 2)
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': 2})
+
+    def test_timeout_attributes_queued_request_interrupted_by_abort(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        queued = {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'}
+        interrupted = {'request_id': 'm', 'status': 'interrupted', 'native_status': 'idle',
+                       'error': {'name': 'MessageAbortedError'}, 'text': 'partial output'}
+        api = mock.Mock()
+        api.snapshot.side_effect = [queued, interrupted]
+        api.abort.return_value = True
+
+        live.enforce_timeout(self.directory, api, 's')
+
+        self.assertEqual(api.snapshot.call_args_list,
+                         [mock.call('s', 'm'), mock.call('s', 'm')])
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': 2})
+        self.assertEqual(live.read(self.directory)['current_result'],
+                         {**interrupted, **live.batch.timeout_diagnostic(2)})
+        self.assertEqual((self.turn / 'result.txt').read_text(), 'partial output')
+
+    def test_timeout_after_queued_abort_preserves_manual_cancellation(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5,
+                    request_cancellation={'request_id': 'm', 'timeout_seconds': None})
+        api = mock.Mock()
+        api.snapshot.side_effect = [
+            {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'},
+            {'request_id': 'm', 'status': 'interrupted', 'native_status': 'idle',
+             'error': {'name': 'MessageAbortedError'}},
+        ]
+        api.abort.return_value = True
+
+        live.enforce_timeout(self.directory, api, 's')
+
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': None})
+        self.assertNotIn('reason', live.read(self.directory)['current_result'])
+
+    def test_timeout_diagnostic_survives_late_wait_and_distinct_send(self):
+        api = mock.Mock()
+        active = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
+        interrupted = {'request_id': 'm', 'status': 'interrupted', 'native_status': 'idle',
+                       'error': {'name': 'MessageAbortedError', 'data': {'message': 'Aborted'}},
+                       'text': 'partial output'}
+        api.snapshot.return_value = active
+        api.abort.return_value = True
+        api.wait.return_value = interrupted
+        live.update(self.directory, timeout_seconds=600, submitted_at=time.time() - 601)
+        live.enforce_timeout(self.directory, api, 's')
+
+        with mock.patch.object(live, 'client', return_value=api):
+            result = live.wait(self.directory)
+        self.assertEqual(result['status'], 'interrupted')
+        self.assertEqual(result['error'], interrupted['error'])
+        self.assertEqual(result['text'], 'partial output')
+        self.assertEqual((result['reason'], result['timeout_seconds']), ('timeout', 600))
+        self.assertIn('Existing edits remain in the worktree.', result['message'])
+        self.assertEqual(json.loads((self.turn / 'status.json').read_text())['reason'], 'timeout')
+
+        live.update(self.directory, server_lifecycle='stopped')
+        self.assertEqual(live.status(self.directory)['reason'], 'timeout')
+        with mock.patch.object(worker, 'STATE', self.root), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(live.main(['wait', self.directory.name]), 124)
+        self.assertEqual(json.loads(output.getvalue())['reason'], 'timeout')
+
+        api.snapshot.return_value = interrupted
+        api.stage.return_value = ('next', {})
+        with (mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'ensure_server'),
+                mock.patch.object(live, 'client', return_value=api)):
+            with worker.credit_lock():
+                worker.credit_save(False, None)
+            self.assertEqual(live.send(self.directory, 'new task', 'new')['request_id'], 'next')
+        self.assertIsNone(live.read(self.directory)['request_cancellation'])
+        self.assertNotIn('reason', live.wait(self.directory, 'm'))
+        live.remember(self.directory, {**interrupted, 'request_id': 'next'})
+        self.assertNotIn('reason', live.status(self.directory))
+        self.assertEqual(json.loads((self.turn / 'status.json').read_text())['reason'], 'timeout')
+
+    def test_timeout_cannot_override_first_manual_cancellation(self):
+        api = mock.Mock()
+        api.abort.return_value = True
+        api.snapshot.return_value = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
+        with (mock.patch.object(worker, 'STATE', self.root), mock.patch.object(live, 'client', return_value=api),
+                contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(live.main(['cancel', self.directory.name]), 0)
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        live.enforce_timeout(self.directory, api, 's')
+        api.abort.assert_has_calls([mock.call('s'), mock.call('s')])
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': None})
+        result = {'request_id': 'm', 'status': 'interrupted', 'error': {'name': 'MessageAbortedError'}}
+        live.remember(self.directory, result)
+        self.assertNotIn('reason', live.wait_result(self.directory, result, 'm'))
+
+    def test_timeout_respects_recently_completed_or_aborted_native_request(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        api = mock.Mock()
+        for status in ('complete', 'interrupted'):
+            with self.subTest(status=status):
+                live.update(self.directory, current_result=None)
+                result = {'request_id': 'm', 'status': status, 'native_status': 'idle'}
+                api.snapshot.return_value = result
+                live.enforce_timeout(self.directory, api, 's')
+                api.abort.assert_not_called()
+                self.assertEqual(live.read(self.directory)['current_result'], result)
+
+    def test_timeout_acknowledgement_does_not_relabel_concurrent_completion(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        api = mock.Mock()
+        api.snapshot.return_value = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
+        api.abort.return_value = True
+        live.enforce_timeout(self.directory, api, 's')
+        result = {'request_id': 'm', 'status': 'complete', 'native_status': 'idle', 'text': 'finished'}
+        live.remember(self.directory, result)
+        with mock.patch.object(live, 'client', return_value=api):
+            self.assertNotIn('reason', live.wait(self.directory))
+        self.assertEqual(live.read(self.directory)['current_result'], result)
+
+    def test_timeout_does_not_claim_ambiguous_native_abort(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        api = mock.Mock()
+        api.snapshot.side_effect = OSError('cannot observe')
+        api.abort.return_value = True
+        live.enforce_timeout(self.directory, api, 's')
+        api.abort.assert_called_once_with('s')
+        result = {'request_id': 'm', 'status': 'interrupted'}
+        live.remember(self.directory, result)
+        self.assertNotIn('reason', live.wait_result(self.directory, result, 'm'))
+
+    def test_timeout_revalidates_retained_provisional_idle_after_deadline(self):
+        for reason in ('idle_unfinished_assistant', 'idle_unanswered_continuation'):
+            with self.subTest(reason=reason):
+                retained = {'request_id': 'm', 'status': 'incomplete',
+                    'native_status': 'idle', 'incomplete_reason': reason}
+                live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5,
+                    current_result=retained, request_cancellation=None)
+                api = mock.Mock()
+                api.snapshot.side_effect = OSError('cannot observe resumed request')
+                api.abort.return_value = True
+
+                live.enforce_timeout(self.directory, api, 's')
+
+                self.assertEqual(api.mock_calls, [mock.call.snapshot('s', 'm'), mock.call.abort('s')])
+                meta = live.read(self.directory)
+                self.assertEqual(meta['current_result'], retained)
+                self.assertIsNone(meta['request_cancellation'])
+
+    def test_timeout_aborts_observed_resumed_work_after_provisional_idle(self):
+        retained = {'request_id': 'm', 'status': 'incomplete',
+            'native_status': 'idle', 'incomplete_reason': 'idle_unfinished_assistant'}
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5,
+            current_result=retained)
+        api = mock.Mock()
+        api.snapshot.return_value = {'request_id': 'm', 'status': 'running', 'native_status': 'busy'}
+        api.abort.return_value = True
+
+        live.enforce_timeout(self.directory, api, 's')
+
+        self.assertEqual(api.mock_calls, [mock.call.snapshot('s', 'm'), mock.call.abort('s')])
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+            {'request_id': 'm', 'timeout_seconds': 2})
+
+    def test_timeout_preserves_definitive_result_or_unexpired_provisional_idle(self):
+        for status, reason, expired in (
+                ('complete', None, True),
+                ('incomplete', 'other_terminal_reason', True),
+                ('incomplete', 'idle_unanswered_continuation', False)):
+            with self.subTest(status=status, reason=reason, expired=expired):
+                retained = {'request_id': 'm', 'status': status, 'incomplete_reason': reason}
+                live.update(self.directory, timeout_seconds=60 if not expired else 2,
+                    submitted_at=time.time() - (5 if expired else 0),
+                    current_result=retained, request_cancellation=None)
+                api = mock.Mock()
+
+                live.enforce_timeout(self.directory, api, 's')
+
+                self.assertEqual(api.mock_calls, [])
+                meta = live.read(self.directory)
+                self.assertEqual(meta['current_result'], retained)
+                self.assertIsNone(meta['request_cancellation'])
 
     def test_timeout_rereads_request_after_control_lock(self):
         live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)

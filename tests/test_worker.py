@@ -474,6 +474,8 @@ class CreditGuardTests(unittest.TestCase):
     def test_interruption_remains_interrupted_even_with_native_error_events(self):
         code, meta = self.native_fixture(self.error('rate_limit_exceeded'), timeout=True)
         self.assertEqual((code, meta['status']), (124, 'interrupted'))
+        self.assertEqual((meta['reason'], meta['timeout_seconds']), ('timeout', 0.1))
+        self.assertIn('Existing edits remain in the worktree.', meta['message'])
         self.assertNotIn('incomplete_reason', meta)
 
     def test_repeated_sigterm_during_cleanup_preserves_escalation_and_metadata(self):
@@ -501,8 +503,12 @@ class CreditGuardTests(unittest.TestCase):
                 with mock.patch.object(worker.subprocess, 'Popen', return_value=process), \
                         mock.patch.object(worker.os, 'killpg') as kill, \
                         mock.patch.object(worker, 'save', side_effect=save):
-                    code, meta = self.native_fixture('')
+                    code, meta = self.native_fixture('', wall_timeout=1)
                 self.assertEqual((code, meta['status']), (124, 'interrupted'))
+                if isinstance(first, KeyboardInterrupt):
+                    self.assertNotIn('reason', meta)
+                else:
+                    self.assertEqual(meta['reason'], 'timeout')
                 self.assertEqual(waits, [3, None])
                 self.assertEqual(kill.call_args_list, [mock.call(12345, worker.signal.SIGTERM),
                                                        mock.call(12345, worker.signal.SIGKILL)])
