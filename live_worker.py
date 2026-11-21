@@ -134,9 +134,22 @@ def enforce_timeout(directory, api, session, stopping=None):
             return
         # OpenCode 1.19.5 can acknowledge abort while a request is still queued
         # and the runner is idle. Keep trying after the deadline, but attribute
-        # timeout only once execution is observable.
+        # timeout only when the same request is observed interrupted. Execution
+        # can start between this snapshot and abort, so inspect the result of a
+        # positive acknowledgement before deciding whether to retry.
         if current.get('status') == 'queued' and current.get('native_status') == 'idle':
-            api.abort(session)
+            if api.abort(session) is True:
+                try:
+                    after_abort = api.snapshot(session, request_id)
+                except (OSError, ValueError):
+                    return
+                if (after_abort.get('request_id') == request_id
+                        and after_abort.get('status') == 'interrupted'):
+                    previous = meta.get('request_cancellation') or {}
+                    if previous.get('request_id') != request_id:
+                        update(directory, request_cancellation={
+                            'request_id': request_id, 'timeout_seconds': timeout})
+                    remember(directory, after_abort)
             return
         cancel_request(directory, api, session, meta, timeout_seconds=timeout)
 

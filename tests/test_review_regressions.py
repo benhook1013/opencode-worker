@@ -381,6 +381,7 @@ class ReviewRegressions(unittest.TestCase):
         api = mock.Mock()
         api.snapshot.side_effect = [
             {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'},
+            {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'},
             {'request_id': 'm', 'status': 'running', 'native_status': 'busy'},
         ]
         api.abort.return_value = True
@@ -392,6 +393,42 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(api.abort.call_count, 2)
         self.assertEqual(live.read(self.directory)['request_cancellation'],
                          {'request_id': 'm', 'timeout_seconds': 2})
+
+    def test_timeout_attributes_queued_request_interrupted_by_abort(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5)
+        queued = {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'}
+        interrupted = {'request_id': 'm', 'status': 'interrupted', 'native_status': 'idle',
+                       'error': {'name': 'MessageAbortedError'}, 'text': 'partial output'}
+        api = mock.Mock()
+        api.snapshot.side_effect = [queued, interrupted]
+        api.abort.return_value = True
+
+        live.enforce_timeout(self.directory, api, 's')
+
+        self.assertEqual(api.snapshot.call_args_list,
+                         [mock.call('s', 'm'), mock.call('s', 'm')])
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': 2})
+        self.assertEqual(live.read(self.directory)['current_result'],
+                         {**interrupted, **live.batch.timeout_diagnostic(2)})
+        self.assertEqual((self.turn / 'result.txt').read_text(), 'partial output')
+
+    def test_timeout_after_queued_abort_preserves_manual_cancellation(self):
+        live.update(self.directory, timeout_seconds=2, submitted_at=time.time() - 5,
+                    request_cancellation={'request_id': 'm', 'timeout_seconds': None})
+        api = mock.Mock()
+        api.snapshot.side_effect = [
+            {'request_id': 'm', 'status': 'queued', 'native_status': 'idle'},
+            {'request_id': 'm', 'status': 'interrupted', 'native_status': 'idle',
+             'error': {'name': 'MessageAbortedError'}},
+        ]
+        api.abort.return_value = True
+
+        live.enforce_timeout(self.directory, api, 's')
+
+        self.assertEqual(live.read(self.directory)['request_cancellation'],
+                         {'request_id': 'm', 'timeout_seconds': None})
+        self.assertNotIn('reason', live.read(self.directory)['current_result'])
 
     def test_timeout_diagnostic_survives_late_wait_and_distinct_send(self):
         api = mock.Mock()
